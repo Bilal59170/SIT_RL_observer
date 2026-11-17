@@ -1,0 +1,7 @@
+.DS_STORE
+logs/
+__pycache__/
+*.pyc
+*.gif
+*.mp4
+wandb/

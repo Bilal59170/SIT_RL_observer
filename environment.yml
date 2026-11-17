@@ -1,0 +1,7 @@
+name: waves
+channels:
+    - defaults
+dependencies:
+    - python=3.8.16
+    - stable-baselines3==1.7.0
+    - tensorboard==2.12.0
