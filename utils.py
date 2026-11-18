@@ -23,23 +23,33 @@ def create_log_dir(subfolder):
 
 def parse_sim_args(args):
     '''Defines the simulation class from args.sim and builds its kwargs from CLI arguments.
-    Raises ValueError if the simulation name is unknown, TypeError if kwargs are invalid.'''
+    - Raises ValueError if the simulation name is unknown, TypeError if kwargs are invalid.
+    - sim_params are parameters that either do not have default values (in Sim_ODE or RL_env classes)
+      or have a specific type that needs eval() such as a list or a np array.'''
 
     available_sims = dict(filter(lambda kv: kv[0].startswith('Sim'), globals().items()))
     try:
         sim_class = available_sims[args.sim]
-    except:
+    except KeyError:
         raise ValueError(f'Simulation "{args.sim}" does not exist. Available simulations are: {", ".join(available_sims.keys())}.')
 
-    # create sim
+    # create sim : 
     try:
-        print("DEBUG:", args)
+        print("(utils.py) MODEL ARGUMENTS:", args)
         sim_params = {}
-        # if args.u_types is not None: sim_params['u_types'] = eval(args.u_types) 
-        if getattr(args, "u_types", None) is not None:
-            sim_params["u_types"] = eval(args.u_types)
-        if args.y0_without_u0 is not None: sim_params['y0_without_u0'] = args.y0_without_u0 
-        if args.dt is not None: sim_params['dt'] = args.dt 
+
+        if getattr(args, "u_types", None) is not None: 
+            sim_params["u_types"] = eval(args.u_types) # dict type
+        if args.y0 is not None: 
+            sim_params['y0'] = eval(args.y0) # np array
+        if args.y0_without_u0 is not None: 
+            sim_params['y0_without_u0'] = args.y0_without_u0 # np array
+
+        if args.dt is not None: 
+            sim_params['dt'] = args.dt 
+        if args.tmax is not None: 
+            sim_params['tmax'] = args.tmax
+        
         sim_kwargs = {
             **sim_params,
             **eval(args.sim_kwargs)
@@ -64,10 +74,8 @@ def parse_env_args(args):
             'tmax': args.tmax,
             'action_min': args.action_min,
             'action_max': args.action_max,
-            'n_past_states': args.n_past_states,
             'n_steps_per_action': args.n_steps_per_action,
-            'discrete': args.discrete,
-            'discrete_n_actions': args.discrete_n_actions
+            'on_time_reward': args.on_time_reward
         }
     }
     

@@ -34,15 +34,14 @@ from functools import partial
 # forking the parent. Prevents workers from re-importing the module and to be stuck. 
 mp.set_start_method("spawn", force=True)
 
-# Global variables
-_worker_model = None
-_worker_env_kwargs = None
+# Global variables 
+_worker_model = None # RL model (used in _worker_init function)
+_worker_env_kwargs = None # arguments (used in _worker_init function)
 MAX_STEPS = 1e10 # max steps to avoid infinite looping in the functions. Value defined in the main 
-# LIST_TYPE_MODELS = ["no_ctrl_E_alone", "ctrl_E_alone", "no_ctrl", "with_ctrl"]
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "cp_path",
@@ -68,13 +67,6 @@ parser.add_argument(
     default=None,
     help="Number of parallel worker processes (default: all available CPUs)",
 )
-# parser.add_argument(
-#     "--type_model",
-#     type=str,
-#     required=True,
-#     default=None,
-#     help="Type of model to test (no_ctrl_E_alone, no_ctrl, with_ctrl)",
-# )
 
 parser.add_argument(
     "--u_types",
@@ -117,19 +109,22 @@ def _run_episode(sim_idx):
 
 def _collect_episodes_parallel(n_sims, model_path_str, env_kwargs,
                                 n_workers, desc="Simulations"):
-    """Distributes n_sims episodes across n_workers processes using a persistent pool.
-    Workers are initialized once (model loaded once per worker), then episodes are
-    dispatched in chunks to amortize spawn overhead."""
+    """Parallel computations. Distributes n_sims episodes across n_workers processes 
+    using a persistent pool. Workers are initialized once (model loaded once per worker),
+    then episodes are dispatched in chunks to amortize spawn overhead."""
 
-    chunksize = max(1, n_sims // n_workers)
-    results = []
-    with mp.Pool(processes=n_workers,
-                 initializer=_worker_init,
+    chunksize = max(1, n_sims // n_workers)  # Number of simulations per workers
+    results = []  
+
+    with mp.Pool(processes=n_workers,        # creates n_workers process 
+                 initializer=_worker_init,    # Load the PPO model once per worker
                  initargs=(model_path_str, env_kwargs)) as pool:
-        for res in tqdm(pool.imap(_run_episode, range(n_sims), chunksize=chunksize),
-                        total=n_sims, desc=desc):
-            results.append(res)
-    return results
+        # runs the episodes in parallel
+        for res in tqdm(pool.imap(_run_episode, range(n_sims), chunksize=chunksize),  
+                        total=n_sims, desc=desc):  # progress bar
+            results.append(res)  # Store the result
+
+    return results  
 
 # ---------------------------------------------------------------------------
 # Auxiliary functions
@@ -139,39 +134,33 @@ def get_convergence_time(array_t, error_array, eps):
     """Renvoit le premier temps à partir duquel l'erreur reste sous eps, ou None."""
     condition = error_array < eps
 
+    assert not np.isnan(error_array).any(), "error_array contient des NaN"
+    assert (error_array >= 0).all(), "error_array contient des valeurs négatives"
+
     for i in range(len(condition) - 1, -1, -1):
-        if not condition[i]:
-            # Le temps de convergence est l'indice suivant (si il existe)
-            if i + 1 < len(array_t):
+        if not condition[i]: # la variable au temps array_t[i] est > eps
+            if i + 1 < len(array_t):  # Le temps de convergence est au temps d'après (s'il existe)
                 return array_t[i + 1]
             else:
                 return None # La condition n'est jamais atteinte définitivement
     # Tous les points vérifient la condition : convergence dès le début
     return array_t[0]
 
-def null_observer_time(array_t, obs_array, state_array, min_value_obs, threshold):
-    """Fonction pour détecter l'annulation d'un observateur alors que l'état correspondant est 
-       plus grand que threshold"""
-    eps = 1e-12
-    idx_array = np.where((obs_array <= min_value_obs + eps) & (state_array > threshold))[0]
-
-    if idx_array.size > 0:
-        idx = idx_array[0]
-        return array_t[idx], idx
-
-    return -1, -1
-
 def worst_null_observer(obs_array, state_array, min_value_obs):
-    """Donne le pire cas où l'observateur s'annule. Retourne la valeur max de l'état du système 
-    aux instants où obs = min_value_obs et state > threshold."""
-    eps = 1e-12
-    worst_state = None
-    for i in range(len(obs_array)):
-        if obs_array[i] <= min_value_obs + eps:
-            if worst_state is None or (state_array[i] > worst_state):
-                worst_state = state_array[i]
-    return worst_state
+    """Donne le pire cas où l'observateur s'annule (i.e vaut min_value_obs) :
+      Correspond à la valeur max de l'état du système aux instants où 
+      l'observateur donné par le RL sature en obs = min_value_obs ."""
+    obs_array = np.asarray(obs_array)
+    state_array = np.asarray(state_array)
 
+    if obs_array.shape[0] == 0 or state_array.shape[0] == 0:
+        return None
+    assert obs_array.shape == state_array.shape, "obs_array et state_array doivent avoir la même longueur"
+    assert not np.isnan(obs_array).any() and not np.isnan(state_array).any(), "NaN détecté dans obs_array ou state_array"
+
+    eps = 1e-12
+    mask = obs_array <= min_value_obs + eps
+    return state_array[mask].max() if mask.any() else None
 
 # ---------------------------------------------------------------------------
 # Plotting functions — now receive pre-collected results, no simulation inside
@@ -204,20 +193,22 @@ def plot_trajectories(results, env, configs,
         raise ValueError(f"Too many results ({len(results)}) for available colors ({len(colors)}).")
 
     for k, res in enumerate(results):
-        # Adaptation for different actions: E_hat, (E_hat, M_hat, F_hat), (E_hat, M_hat, F_hat, Ms_hat)
-        N_t, nb_act = res["Y_hat"].shape
+        # Adaptation for different actions: filling missing columns of Y_hat with nan values
+        # nb_act : shape of the observer (usually 1, 3 or 4 :  E_hat, (E_hat, M_hat, F_hat) or (E_hat, M_hat, F_hat, Ms_hat)
+        N_t, nb_act = res["Y_hat"].shape 
         # print(f"(DEBUG) action number : {nb_act} ")
-        p = 4 - nb_act
+        assert nb_act <= 4, f"nb_act ({nb_act}) ne peut pas dépasser 4 (E, M, F, Ms)"
+        p = 4 - nb_act 
         fill_val = np.nan
         new_cols = np.full((N_t, p), fill_val)
         # print(f"(DEBUG) shape new cols: {new_cols.shape}")
-        array_Y_hat = np.concatenate((res["Y_hat"], new_cols),axis=1)
+        # always the last observers that are not considered  (e.g Ms_hat when (E_hat, M_hat, F_hat) is observed)
+        array_Y_hat = np.concatenate((res["Y_hat"], new_cols),axis=1) 
         # print(f"(DEBUG) shape array_y_hat: {array_Y_hat.shape}")
 
         color = colors[k]
         array_t     = res["t"]
-        array_Y     = res["Y"][:, :-1]   # drop last col (control)
-        # array_Y_hat = res["Y_hat"]
+        array_Y     = res["Y"][:, :-1]   # drop last columns (control)
         array_u     = res["Y"][:, -1]
         rewards     = res["rewards"]
         t_rewards   = res["t_rewards"]
@@ -267,8 +258,9 @@ def plot_histograms(results, env, n_sims,
     Receives pre-collected episode results. File-saving logic is identical to the original. 
     Handles several shape of action (nb_act = 1, 3 or 4) automatically.
     """
+    assert len(results) == n_sims, "n_sims ne correspond pas au nombre de résultats"
 
-    nb_act = results[0]["Y_hat"].shape[1]
+    nb_act = results[0]["Y_hat"].shape[1] # shape of the observer (E, (E, M, F), (E, M, F, Ms) usually)
     labels = ['E', 'M', 'F', 'Ms'][:nb_act]
 
     fig, axes = plt.subplots(nb_act, 3, figsize=(15, 3 * nb_act))
@@ -287,7 +279,8 @@ def plot_histograms(results, env, n_sims,
 
         if bool_test_null_observer:
             for k in range(nb_act):
-                worst = worst_null_observer(obs_array=array_Y_hat[:, k], state_array=array_Y[:, k], min_value_obs=env.sim.min_value_obs)
+                worst = worst_null_observer(obs_array=array_Y_hat[:, k],
+                                             state_array=array_Y[:, k], min_value_obs=env.sim.min_value_obs)
                 if worst is not None:
                     null_lists[k].append(worst)
 
@@ -386,13 +379,10 @@ def plot_histograms(results, env, n_sims,
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-
     # ---------------------------------------------------------------------------
     # Load model and config
     # ---------------------------------------------------------------------------
-
     model_path = Path(args.cp_path)
-    model = PPO.load(str(model_path))
     if ("checkpoints" in str(model_path)) or ("best_model" in str(model_path)):
         with open(str(model_path.parent.parent / "configs.json"), "r") as f:
             configs = json.load(f)
@@ -401,10 +391,10 @@ if __name__ == "__main__":
             configs = json.load(f)
     env_kwargs = parse_env_args(configs["args"])
 
+
     # ---------------------------------------------------------------------------
     # Load control choice and create env for reference. 
     #---------------------------------------------------------------------------
-
     if args.u_types is not None:
         parsed = eval(args.u_types)
         env_kwargs["sim_kwargs"]["u_types"] = parsed            
@@ -421,24 +411,24 @@ if __name__ == "__main__":
 
     ctrl_dict = env_kwargs["sim_kwargs"]["u_types"]
     foldername_ctrl_type =  "_".join(f"{k}-{v}" for k, v in sorted(ctrl_dict.items()))
-    print(f"(DEBUG) ctrl file filename: {foldername_ctrl_type}")
+    # print(f"(DEBUG) ctrl file filename: {foldername_ctrl_type}")
     
     # Env creation
     env = RL_env(**env_kwargs)
-
     N_WORKERS = args.n_workers if args.n_workers is not None else mp.cpu_count()
     print(f"[parallel] Using {N_WORKERS} worker processes on {mp.cpu_count()} available CPUs.")
 
     n_traj   = args.n_traj
     n_hist   = args.n_hist
-    # write the final values of the observer in a txt file. Used to fix a null observer issue
-    bool_final_values = True 
     # Indexes of the simulations where the observer vanishes while the state is still high.
     # Used to fix a null observer issue
     bool_test_null_observer = True 
     model_path_str = str(model_path)
 
-    # ---- Preparing file titles (unchanged from original) ----
+
+    # ---------------------------------------------------------------------------
+    # Preparing file titles 
+    # ---------------------------------------------------------------------------
     run_folder = (
         model_path.parent.parent
         if ("checkpoints" in str(model_path)) or ("best_model" in str(model_path))
@@ -469,7 +459,7 @@ if __name__ == "__main__":
     title_plot_traj = model_label + f" -- trajectoires sur {n_traj} épisodes"
     title_plot_hist = model_label + f" -- métriques sur {n_hist} épisodes"
 
-    #Different tmax
+    # Different tmax
     tmax_title = "T_default" if args.tmax is None else f"T_{args.tmax}"
     if "checkpoints" in str(model_path):
         title_folder = Path(folder_name + "_plot") / tmax_title / f"checkpoints_{n_steps_cp}"
@@ -480,13 +470,13 @@ if __name__ == "__main__":
 
     title_folder = title_folder / foldername_ctrl_type
 
+    # print("DEBUG: ", title_folder)
 
-    # print("DEBUG: ", title_plot_hist)
 
-    # ---- Collect episodes in parallel ----
-    # Trajectories and histograms share independent episodes; collect separately
-    # so each set has its own i.i.d. rollouts.
-
+    # ---------------------------------------------------------------------------
+    #  Collect episodes in parallel 
+    # ---------------------------------------------------------------------------
+    # Trajectories and histograms share independent episodes; collect separately so each set has its own i.i.d. rollouts.
     print(f"\n[parallel] Collecting {n_traj} trajectory episodes...")
     traj_results = _collect_episodes_parallel(
         n_sims=n_traj,
@@ -505,7 +495,10 @@ if __name__ == "__main__":
         desc="Histogrammes",
     )
 
-    # ---- Plot and save (main process only, identical filenames/dirs) ----
+
+    # ---------------------------------------------------------------------------
+    #  Plot and save (main process only, identical filenames/dirs) 
+    # ---------------------------------------------------------------------------
     plot_trajectories(
         traj_results, env=env, configs=configs,
         show_plot=False, save_plot=True,

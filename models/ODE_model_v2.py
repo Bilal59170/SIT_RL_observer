@@ -8,8 +8,6 @@ Modified mosquito model:
     dM/dt   = (1 - nu) * nu_E * E - delta_M * M
     dM_s/dt = u - delta_S * M_s
 
-Main observation (ovitrap collection): E(t_n)
-
 """
 
 import numpy as np
@@ -51,8 +49,14 @@ class SimODE_v2:
         # Action
         action_only_E=False, # Output
         action_only_EMF=False,
-        min_value_obs=0 # minimal value authorized for the observer 
+        min_value_obs=0, # minimal value authorized for the observer 
+
+        # History
+        y_period_history=None,
+        length_y_history: int = 1
         ):
+
+
 
         #  biological model parameters 
         self.beta_E  = PARAMETERS_MODEL_ODE['beta_E']
@@ -82,7 +86,7 @@ class SimODE_v2:
         self.obs_time=obs_time
         self.obs_time_mode=obs_time_mode
         self.obs_multi_scaling = obs_multi_scaling
-
+        
         # State
         self.n_state = 4
 
@@ -97,25 +101,55 @@ class SimODE_v2:
             self.n_action = 4
         self.min_value_obs = min_value_obs
 
+        # Historics
+        if y_period_history is not None and not (self.obs_E_state) : 
+            ValueError("Historic not implemented for observations other than E and u.")
+        self.y_period_history = y_period_history # same period for any state historic
+        self.length_y_history = length_y_history
+        self.next_y_time = np.inf
+        # E
+        self.length_E_hist = length_y_history
+        self._E_history = None # history of E, initialised in reset()
+        self.next_E_time = np.inf
+        # u 
+        self.length_u_history = length_y_history
+        self._u_history = None # history of u, initialised in reset()
+        self.next_u_time = np.inf
+        # y_hat
+        self.length_y_hat_history = length_y_history  # same length as y_history
+        self.next_y_hat_time = np.inf
+        self._y_hat_history = None # initilised in reset()
+
         # Control parameters
         self.u_types = u_types
         self.ctrl_mode_resurgence = 0 # set of the control is 0 or not to allow resurgence
         # Set the control function
-        self.u_fct, self.current_u_type = choose_u(
-            u_types, tmax=tmax, instance_ODE_model=self)
+        self.u_fct, self.current_u_type = choose_u(u_types, instance_ODE_model=self)
+
+        # Etat de la simulation (valeurs reelles assignees dans reset(), ci-dessous)
+        self.t = None
+        self.y = None
+        self.y_hat = None
+        self.t_lst = None
+        self.y_lst = None
+        self.y_hat_lst = None
+
 
         #### Reset of the simulation ####
         self.reset(y0_without_u0)
 
-        
+    
+    ####################################
+    # reset / update / history management
+    #####################################
+
     def reset(self, y0_without_u0=None):
         '''Reset the simulation. Called at each episode.'''
         self.t = 0.0
 
         # Take another control for the next episode
         self.ctrl_mode_resurgence = 0 # Put back the control to inactive in the case of control for resurgence 
-        self.u_fct, self.current_u_type = choose_u(
-            self.u_types, tmax=self.tmax, instance_ODE_model=self)
+        self.u_fct, self.current_u_type = choose_u(self.u_types, instance_ODE_model=self)
         
         # Initializes (E, M, F, Ms)
         if y0_without_u0 is not None:
@@ -130,10 +164,31 @@ class SimODE_v2:
         
         # Initializes randomly the observer that is constructed with reinforcement learning: (E, M, F, Ms) hat or (E, M, F) or (E)
         self.y_hat = np.random.uniform(low=0.0, high= self.factor_K * self.K, size=(self.n_action)) 
-
         self.t_lst = [self.t]
         self.y_lst = [np.copy(self.y)]
         self.y_hat_lst = [np.copy(self.y_hat)]
+
+        ## History management
+        if self.y_period_history is not None:
+            self.next_y_time = self.y_period_history # next time to store the history of y
+        else:
+            self.next_y_time = np.inf 
+        # E
+        e0 = self.y[0]
+        self._E_history = deque([e0] * self.length_E_hist, maxlen=self.length_E_hist)
+        self.next_E_time = self.next_y_time
+        # u
+        self._u_history = deque([self.y[4]] * self.length_u_history, maxlen=self.length_u_history)
+        self.next_u_time = self.next_y_time
+
+        # y_hat
+        # ATTENTION : contrairement à E (scalaire), y_hat est un np.array mutable donc on utilise 
+        # np.copy() distinct pour éviter les dépendences entre les élements de l'historique.
+        self._y_hat_history = deque(
+            [np.copy(self.y_hat) for _ in range(self.length_y_hat_history)],
+            maxlen=self.length_y_hat_history
+        )
+        self.next_y_hat_time = self.next_y_time
 
     def dynamics(self, y):
         """
@@ -153,8 +208,61 @@ class SimODE_v2:
 
         return np.array([dE_dt, dM_dt, dF_dt, dMs_dt])
     
+    def update_observations_aux(self, period, state, history, t, next_time):
+        """Auxiliary function to update observations based on a given period.
+
+        - y_period None  : lecture instantanee a chaque appel.
+        - y_period defini : releve seulement tous les y_period jours ;
+          entre deux releves, l'agent voit la derniere valeur connue.
+        """
+
+        # IMPORTANT : get_obs() lit history (pas last_obs),
+        # il faut donc alimenter la deque a chaque appel, sinon l'historique
+        # reste fige sur sa valeur d'initialisation (observation morte).
+        if period is None:
+            # comportement instantane (retrocompatible avec le cas sans historique)
+            last_obs = np.copy(state)
+            history.append(last_obs)
+            return 
+        
+        eps = 1e-12
+        while t + eps >= next_time:
+            last_obs = np.copy(state)
+            history.append(last_obs)
+            next_time += period
+        
+        return next_time
+
+    def update_observation_y_hat(self):
+        next_time = self.update_observations_aux(
+            period=self.y_period_history,
+            state=self.y_hat, history=self._y_hat_history, t=self.t,
+            next_time=self.next_y_hat_time
+        )
+        if next_time is not None:
+            self.next_y_hat_time = next_time
+ 
+    def update_observation_E(self):
+        next_time = self.update_observations_aux(
+            period=self.y_period_history,
+            state=self.y[0], history=self._E_history, t=self.t,
+            next_time=self.next_E_time
+        )
+        if next_time is not None:
+            self.next_E_time = next_time
+
+    def update_observation_u(self):
+        next_time = self.update_observations_aux(
+            period=self.y_period_history,
+            state=self.y[4], history=self._u_history, t=self.t,
+            next_time=self.next_u_time
+        )
+        if next_time is not None:
+            self.next_u_time = next_time
+
     def update_y(self):
         '''One Euler step of the system.'''
+
         # Computation of (E, M, F, Ms)(t+dt) with with explicit Euler
         new_emfs = self.y[:4] + self.dt * self.dynamics(self.y)
 
@@ -164,9 +272,14 @@ class SimODE_v2:
         # Rebuild full state (E, M, F, Ms, u)(t+dt)
         self.y   = np.append(new_emfs, new_u)
 
+        # Update historic 
+        self.update_observation_E() # E(t) 
+        self.update_observation_u() # u(t)
+
     def update_y_hat(self, action): 
         """Update the observer. Used in env.py, not in step."""
         self.y_hat = action # Direct approximation of the state : y_hat = action 
+        self.update_observation_y_hat()
 
     def step(self, action, store=False):
         """Execute one step of the simulation.
@@ -179,7 +292,7 @@ class SimODE_v2:
         # increment time
         self.t += self.dt
         self.update_y()
-        self.update_y_hat(action)  # ← y_hat mis à jour à chaque pas
+        self.update_y_hat(action)  # y_hat updated at each step
 
         # save for later plotting/metrics only when requested
         if store:
@@ -187,11 +300,9 @@ class SimODE_v2:
             self.y_lst.append(np.copy(self.y))
             self.y_hat_lst.append(np.copy(self.y_hat))
     
-    def simulate(self, n_steps):
-        """Simulates the dynamics of the system. Used in tests to see the chosen control acting."""
-        for _ in range(n_steps):
-            # action = np.zeros(self.n_action) : fake action to only focus on real state
-            self.step(action=np.zeros(self.n_action), store=True)  
+    ##################
+    # Observations 
+    ##################
 
     def _get_time_obs(self):
         """
@@ -215,6 +326,69 @@ class SimODE_v2:
         else:
             raise ValueError("obs_time_mode value is wrong. Should be \"absolute\", \"season\", or \"week_in_year\".")
  
+    def _append_E_scaled(self, state, value):
+        """Normalisation multi-échelle (6 paliers) pour un compartiment type E/M/F."""
+        if self.obs_multi_scaling:
+            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
+            state.append(normalize(min(value, self.K),      0, self.K))
+            state.append(normalize(min(value, 5000),        0, 5000))
+            state.append(normalize(min(value, 500),         0, 500))
+            state.append(normalize(min(value, 50),          0, 50))
+            state.append(normalize(min(value, 5),           0, 5))
+        else:
+            state.append(normalize(value, 0, 2 * self.K))
+    
+    def _append_M_scaled(self, state, value):
+        self._append_E_scaled(state, value)
+
+    def _append_F_scaled(self, state, value):
+        """Pareil que pour E mais scaling sans multi scaling est de 5*K et non de 2*K car F souvent plus grand que 2K. """
+        if self.obs_multi_scaling:
+            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
+            state.append(normalize(min(value, self.K),      0, self.K))
+            state.append(normalize(min(value, 5000),        0, 5000))
+            state.append(normalize(min(value, 500),         0, 500))
+            state.append(normalize(min(value, 50),          0, 50))
+            state.append(normalize(min(value, 5),           0, 5))
+        else:
+            state.append(normalize(value, 0, 5 * self.K))
+
+    def _append_Ms_scaled(self, state, value):
+        """Normalisation multi-échelle (8 paliers) pour un compartiment type Ms."""
+        if self.obs_multi_scaling:
+            state.append(normalize(value, 0, 100 * self.K))
+            state.append(normalize(min(value, 50 * self.K), 0, 50 * self.K))
+            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
+            state.append(normalize(min(value, self.K),      0, self.K))
+            state.append(normalize(min(value, 5000),        0, 5000))
+            state.append(normalize(min(value, 500),         0, 500))
+            state.append(normalize(min(value, 50),          0, 50))
+            state.append(normalize(min(value, 5),           0, 5))
+        else:
+            state.append(normalize(value, 0, 50 * self.K))
+
+    def _apprend_u_scaled(self, state, value):
+        """Normalisation multi-échelle (6 paliers) pour le contrôle u."""
+        if self.obs_multi_scaling:
+            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
+            state.append(normalize(min(value, self.K),      0, self.K))
+            state.append(normalize(min(value, 5000),        0, 5000))
+            state.append(normalize(min(value, 500),         0, 500))
+            state.append(normalize(min(value, 50),          0, 50))
+            state.append(normalize(min(value, 5),           0, 5))
+        else:
+            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
+
+    def _append_y_hat_vector(self, state, y_hat_vec):
+        """Append un snapshot de y_hat, robuste à sa taille (1, 3 ou 4)."""
+        n = len(y_hat_vec)
+        self._append_E_scaled(state, y_hat_vec[0])       # E_hat, toujours présent
+        if n >= 3:
+            self._append_M_scaled(state, y_hat_vec[1])   # M_hat
+            self._append_F_scaled(state, y_hat_vec[2])   # F_hat
+        if n >= 4:
+            self._append_Ms_scaled(state, y_hat_vec[3])  # Ms_hat
+
     def get_obs(self):
         """Get the observations of the systems. 
         (History) Historics of observations can be added. The order of how
@@ -223,170 +397,42 @@ class SimODE_v2:
         state = []
 
         y = self.y
-        y_hat = self.y_hat
 
         # Time t
         if self.obs_time:
             state.append(self._get_time_obs())
 
         # Observer
-        if self.obs_y_hat: 
-            if self.action_only_E:
-                e_hat = y_hat[0]
-
-                if self.obs_multi_scaling:
-                    state.append(normalize(min(e_hat, 10 * self.K), 0, 10 * self.K))
-                    state.append(normalize(min(e_hat, self.K),      0, self.K))
-                    state.append(normalize(min(e_hat, 5000),        0, 5000))
-                    state.append(normalize(min(e_hat, 500),         0, 500))
-                    state.append(normalize(min(e_hat, 50),          0, 50))
-                    state.append(normalize(min(e_hat, 5),           0, 5))
-                else:
-                    state.append(normalize(e_hat, 0, 2 * self.K))
-            elif self.action_only_EMF:
-                e_hat , m_hat , f_hat = y_hat[0], y_hat[1], y_hat[2]
-
-                if self.obs_multi_scaling:
-                    state.append(normalize(min(e_hat , 10 * self.K), 0, 10 * self.K))
-                    state.append(normalize(min(e_hat , self.K),      0, self.K))
-                    state.append(normalize(min(e_hat , 5000),        0, 5000))
-                    state.append(normalize(min(e_hat , 500),         0, 500))
-                    state.append(normalize(min(e_hat , 50),          0, 50))
-                    state.append(normalize(min(e_hat , 5),           0, 5))
-
-                    state.append(normalize(min(m_hat , 10 * self.K), 0, 10 * self.K))
-                    state.append(normalize(min(m_hat , self.K),      0, self.K))
-                    state.append(normalize(min(m_hat , 5000),        0, 5000))
-                    state.append(normalize(min(m_hat , 500),         0, 500))
-                    state.append(normalize(min(m_hat , 50),          0, 50))
-                    state.append(normalize(min(m_hat , 5),           0, 5))
-
-                    state.append(normalize(min(f_hat, 10 * self.K), 0, 10 * self.K))
-                    state.append(normalize(min(f_hat, self.K),      0, self.K))
-                    state.append(normalize(min(f_hat, 5000),        0, 5000))
-                    state.append(normalize(min(f_hat, 500),         0, 500))
-                    state.append(normalize(min(f_hat, 50),          0, 50))
-                    state.append(normalize(min(f_hat, 5),           0, 5))
-                else:
-                    state.append(normalize(e_hat , 0, 2 * self.K))
-                    state.append(normalize(m_hat , 0, 2 * self.K))
-                    state.append(normalize(f_hat, 0, 5 * self.K))
-            else: # Case with  y_hat = (E_hat, M_hat, F_hat, Ms_hat)
-                e_hat , m_hat , f_hat, ms_hat = y_hat[0], y_hat[1], y_hat[2], y_hat[3]
-
-                if self.obs_multi_scaling:
-                    state.append(normalize(min(e_hat , 10 * self.K), 0, 10 * self.K))
-                    state.append(normalize(min(e_hat , self.K),      0, self.K))
-                    state.append(normalize(min(e_hat , 5000),        0, 5000))
-                    state.append(normalize(min(e_hat , 500),         0, 500))
-                    state.append(normalize(min(e_hat , 50),          0, 50))
-                    state.append(normalize(min(e_hat , 5),           0, 5))
-
-                    state.append(normalize(min(m_hat , 10 * self.K), 0, 10 * self.K))
-                    state.append(normalize(min(m_hat , self.K),      0, self.K))
-                    state.append(normalize(min(m_hat , 5000),        0, 5000))
-                    state.append(normalize(min(m_hat , 500),         0, 500))
-                    state.append(normalize(min(m_hat , 50),          0, 50))
-                    state.append(normalize(min(m_hat , 5),           0, 5))
-
-                    state.append(normalize(min(f_hat, 10 * self.K), 0, 10 * self.K))
-                    state.append(normalize(min(f_hat, self.K),      0, self.K))
-                    state.append(normalize(min(f_hat, 5000),        0, 5000))
-                    state.append(normalize(min(f_hat, 500),         0, 500))
-                    state.append(normalize(min(f_hat, 50),          0, 50))
-                    state.append(normalize(min(f_hat, 5),           0, 5))
-
-                    state.append(normalize(ms_hat, 0, 100 * self.K))
-                    state.append(normalize(min(ms_hat, 50 * self.K), 0, 50 * self.K))
-                    state.append(normalize(min(ms_hat, 10 * self.K), 0, 10 * self.K))
-                    state.append(normalize(min(ms_hat, self.K),      0, self.K))
-                    state.append(normalize(min(ms_hat, 5000),        0, 5000))
-                    state.append(normalize(min(ms_hat, 500),         0, 500))
-                    state.append(normalize(min(ms_hat, 50),          0, 50))
-                    state.append(normalize(min(ms_hat, 5),           0, 5))
-                else:
-                    state.append(normalize(e_hat , 0, 2 * self.K))
-                    state.append(normalize(m_hat , 0, 2 * self.K))
-                    state.append(normalize(f_hat, 0, 5 * self.K))
-                    state.append(normalize(ms_hat, 0, 50 * self.K))
+        if self.obs_y_hat:
+            for y_hat_snapshot in self._y_hat_history:
+                self._append_y_hat_vector(state, y_hat_snapshot)
                 
-
-        # Ohter
+        # Other
         if self.obs_E_state:
-            e_obs = y[0]
-
-            if self.obs_multi_scaling:
-                state.append(normalize(min(e_obs, 10 * self.K), 0, 10 * self.K))
-                state.append(normalize(min(e_obs, self.K),      0, self.K))
-                state.append(normalize(min(e_obs, 5000),        0, 5000))
-                state.append(normalize(min(e_obs, 500),         0, 500))
-                state.append(normalize(min(e_obs, 50),          0, 50))
-                state.append(normalize(min(e_obs, 5),           0, 5))
-            else:
-                state.append(normalize(y[0], 0, 2 * self.K))
+            for e_state in self._E_history:
+                self._append_E_scaled(state, value=e_state)
 
         if self.obs_EMF:
             e_obs, m_obs, f_obs = y[0], y[1], y[2]
+            self._append_E_scaled(state, value=e_obs)
+            self._append_M_scaled(state, value=m_obs)
+            self._append_F_scaled(state, value=f_obs)
 
-            if self.obs_multi_scaling:
-                state.append(normalize(min(e_obs, 10 * self.K), 0, 10 * self.K))
-                state.append(normalize(min(e_obs, self.K),      0, self.K))
-                state.append(normalize(min(e_obs, 5000),        0, 5000))
-                state.append(normalize(min(e_obs, 500),         0, 500))
-                state.append(normalize(min(e_obs, 50),          0, 50))
-                state.append(normalize(min(e_obs, 5),           0, 5))
-
-                state.append(normalize(min(m_obs, 10 * self.K), 0, 10 * self.K))
-                state.append(normalize(min(m_obs, self.K),      0, self.K))
-                state.append(normalize(min(m_obs, 5000),        0, 5000))
-                state.append(normalize(min(m_obs, 500),         0, 500))
-                state.append(normalize(min(m_obs, 50),          0, 50))
-                state.append(normalize(min(m_obs, 5),           0, 5))
-
-                state.append(normalize(min(f_obs, 10 * self.K), 0, 10 * self.K))
-                state.append(normalize(min(f_obs, self.K),      0, self.K))
-                state.append(normalize(min(f_obs, 5000),        0, 5000))
-                state.append(normalize(min(f_obs, 500),         0, 500))
-                state.append(normalize(min(f_obs, 50),          0, 50))
-                state.append(normalize(min(f_obs, 5),           0, 5))
-            else:
-                state.append(normalize(e_obs, 0, 2 * self.K))
-                state.append(normalize(m_obs, 0, 2 * self.K))
-                state.append(normalize(f_obs, 0, 5 * self.K))
-
-        # Mâles stériles Ms
         if self.obs_Ms:
             # Same rescaling as M+Ms in the control code
             ms = y[3]
-            if self.obs_multi_scaling:
-                state.append(normalize(ms, 0, 100 * self.K))
-                state.append(normalize(min(ms, 50 * self.K), 0, 50 * self.K))
-                state.append(normalize(min(ms, 10 * self.K), 0, 10 * self.K))
-                state.append(normalize(min(ms, self.K),      0, self.K))
-                state.append(normalize(min(ms, 5000),        0, 5000))
-                state.append(normalize(min(ms, 500),         0, 500))
-                state.append(normalize(min(ms, 50),          0, 50))
-                state.append(normalize(min(ms, 5),           0, 5))
-            else:
-                state.append(normalize(y[3], 0, 50 * self.K))
+            self._append_Ms_scaled(state, value=ms)
 
-        # control u
-        if self.obs_u :
-            # state.append(normalize(y[4], 0, 2 * self.K))
-            
-            u_obs = y[4]
-            if self.obs_multi_scaling:
-                state.append(normalize(min(u_obs, 10 * self.K), 0, 10 * self.K)) # ~ delta_s * Ms
-                state.append(normalize(min(u_obs, self.K),      0, self.K))
-                state.append(normalize(min(u_obs, 5000),        0, 5000))
-                state.append(normalize(min(u_obs, 500),         0, 500))
-                state.append(normalize(min(u_obs, 50),          0, 50))
-                state.append(normalize(min(u_obs, 5),           0, 5))
-            else: 
-                state.append(normalize(min(u_obs, 10 * self.K), 0, 10 * self.K))
+        if self.obs_u:
+            for u_snap in self._u_history:
+                self._apprend_u_scaled(state, value=u_snap)
 
         return np.array(state)  # no normalisation or multi-scale strategy for now
     
+    ##############
+    # Reward
+    ##############
+
     def reward(self, action=None):
         reward = 0
         reward_info = {}
@@ -409,12 +455,29 @@ class SimODE_v2:
             reward_info["rwd_y123"] = r
             reward += r
 
+        if self.rwd_y4 > 0:
+            if self.n_action < 3:
+                raise ValueError("rwd_y4 requires the full 4-component observer")
+            r = -self.rwd_y4 * np.linalg.norm(self.y[3]-self.y_hat[3]) / self.K
+            reward_info["rwd_y4"] = r
+            reward += r
+
         return reward, reward_info
+
+    ##################
+    # Other functions
+    ##################
 
     def norm_y(self):
         """Compute the norm of the state without the control u."""
         return np.sum(self.y[:-1]**2)**0.5
-
+    
+    def simulate(self, n_steps):
+        """Simulates the dynamics of the system. Used in tests to see the chosen control acting."""
+        for _ in range(n_steps):
+            # action = np.zeros(self.n_action) : fake action to only focus on real state
+            self.step(action=np.zeros(self.n_action), store=True)  
+    
     def plot(self, title="Mosquito model dynamics", title_ctrl = "", eq_point = None, bool_show=True):
         '''Plot le résultat de la simulation du système sans contrôle.'''
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))

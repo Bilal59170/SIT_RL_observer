@@ -23,6 +23,7 @@ PARAMETERS_MODEL_ODE = {
     'gamma_s': gamma_s
 }
 
+
 # Linear control main constants
 R0 = beta_E * nu * nu_E / (delta_F * (delta_E + nu_E))
 k_E_min = delta_s * (1 - nu) * nu_E * (R0 - 1) / (gamma_s * delta_M)
@@ -41,7 +42,9 @@ def choose_k_F():
     return np.random.uniform(0, 2 * k_F_min)
 
 def resurgence_lin_ctrl(t, EMFMs, threshold_inf, threshold_sup, instance_ODE_model, k, idx_state):
-    """Linear control which is 0 when the number of eggs E is too low to allows population resurgence"""
+    """Switching Linear control : 
+     - Switch to 0 when the number of eggs E is too low to (<threshold_inf) allows population resurgence
+     - Switch to linear control when the number of egg is too large (> threshold_sup) """
     if instance_ODE_model.ctrl_mode_resurgence==0: # ctrl is 0 to let population grow
         if EMFMs[0] > threshold_sup :
             instance_ODE_model.ctrl_mode_resurgence = 1
@@ -54,15 +57,13 @@ def resurgence_lin_ctrl(t, EMFMs, threshold_inf, threshold_sup, instance_ODE_mod
         raise ValueError("ctrl_mode_resurgence should be either 0 or 1")
 
 # Main function
-def choose_u(u_types, umax = None, period_random_ctrl=None, tmax = None, instance_ODE_model=None):
+def choose_u(u_types, instance_ODE_model=None):
     """
         Function to choose u for the training of the observer RL model. It is called at each 
         beginning of an episode.
             - u_types : dict that indicates a probability distribution over the possible controls,
               e.g dict("u=kE":0.4, "u=kF":0.6).
     """
-    if ((umax is None) or (period_random_ctrl is None)) and ("random" in u_types):
-        raise ValueError("umax and period_random_ctrl must be not None with control type \"random\". ")
     
     keys = list(u_types.keys())
     probs = list(u_types.values())
@@ -91,7 +92,7 @@ def choose_u(u_types, umax = None, period_random_ctrl=None, tmax = None, instanc
                 t, EMFMs, threshold_inf, threshold_sup, instance_ODE_model, k, idx_state)
             
         case "res_lin":
-            # control that allows resurgence but with non-deterministic thresholds to aloow diversity.
+            # control that allows resurgence but with non-deterministic thresholds to alow diversity.
 
             # choice of the linear control
             if np.random.randint(0, 2):
@@ -106,18 +107,6 @@ def choose_u(u_types, umax = None, period_random_ctrl=None, tmax = None, instanc
             # Final control function
             ctrl_fct = lambda t, EMFMs: resurgence_lin_ctrl(
                 t, EMFMs, threshold_inf, threshold_sup, instance_ODE_model, k, idx_state)
-            
-
-        # case "random_bang_bang":
-        #     # control value changes match observations. 
-        #     if tmax%period_random_ctrl == 0 : 
-        #         number_values_ctrl = int(tmax // period_random_ctrl) 
-        #     else: 
-        #         number_values_ctrl = int(tmax // period_random_ctrl) + 1 
-        #     # example: (t_max, period) = (11, 2) gives 6 jumps with last period of length 1; (10, 2) gives 5 
-        #     binary_array = np.random.randint(0, 2, size=number_values_ctrl)
-        #     ctrl_array = umax * binary_array
-        #     ctrl_fct = lambda t, EMFMs: ctrl_array[min(int(t), int(tmax)-1) // period_random_ctrl]
 
         case _:
             raise ValueError("Unvalid control type")
@@ -128,8 +117,3 @@ if False:
     print("Test k : ", )
     for _ in range(5):
         print(f"-  kE = {choose_k_E()}, kF = {choose_k_F()}")
-
-    period_random_ctrl_test, number_ctrl_jumps_test = 2, 5
-    T = period_random_ctrl_test * number_ctrl_jumps_test # = 10
-    u_test = choose_u("random_bang_bang", umax=0.5, period_random_ctrl=period_random_ctrl_test, number_ctrl_jumps=number_ctrl_jumps_test)
-    print("Test u : ", [u_test(t, np.ones(4)) for t in range(T)])

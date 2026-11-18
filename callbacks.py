@@ -6,7 +6,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
-from collections import defaultdict
 
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import Figure
@@ -94,7 +93,7 @@ class TensorboardCallback(BaseCallback):
 
             gamma = self.model.gamma
 
-            result = self.eval_env.run_episode(self.model, deterministic=True)
+            result = self.eval_env.run_episode(self.model, deterministic=True) # runs one episode of dt * nb_step_per_action steps
             rewards = result["rewards"]
             t_lst, y_lst, y_hat_lst = result["t"], result["Y"], result["Y_hat"]
             env_times = np.copy(result["t_rewards"])
@@ -103,7 +102,8 @@ class TensorboardCallback(BaseCallback):
             rewards = np.array(rewards)
             t_lst = np.array(self.eval_env.sim.t_lst)
             y_lst = np.array(self.eval_env.sim.y_lst)         # shape (T, 5) : [E, M, F, Ms, u] 
-            y_hat_lst = np.array(self.eval_env.sim.y_hat_lst)  # shape (T, 4) : [E_hat, M_hat, F_hat, Ms_hat] or [E, M, F] or [E]
+            # shape (T, n_act), n_act in {1, 3, 4} : [E_hat, M_hat, F_hat, Ms_hat] or [E, M, F] or [E]
+            y_hat_lst = np.array(self.eval_env.sim.y_hat_lst)  
             K = self.eval_env.sim.K
 
             # discounted reward gamma^t * r_t (t indexé sur les actions, pas le temps physique)
@@ -116,8 +116,6 @@ class TensorboardCallback(BaseCallback):
             self.logger.record('eval/discounted_return', np.sum(discounted_rewards))
 
             # ── LOG PLOTS ────────────────────────────────────────────────
-
-
             def plot(name, x, y_dict, xlabel, ylabel, title,
                     grid=True, legend=True, figsize=(5, 3), max_points=1000):
                 # sous-échantillonnage pour avoir un plot moins cher
