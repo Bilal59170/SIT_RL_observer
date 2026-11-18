@@ -39,6 +39,7 @@ class SimODE_v2:
         y0_without_u0=None,
 
         # Observations
+        obs_y_hat=False,
         obs_u=False,
         obs_E_state=False,
         obs_EMF = False,
@@ -73,6 +74,7 @@ class SimODE_v2:
         self.factor_K = factor_K
 
         # Observations
+        self.obs_y_hat=obs_y_hat
         self.obs_u=obs_u
         self.obs_E_state=obs_E_state
         self.obs_EMF=obs_EMF
@@ -150,19 +152,20 @@ class SimODE_v2:
         dMs_dt = u - self.delta_s * Ms
 
         return np.array([dE_dt, dM_dt, dF_dt, dMs_dt])
-
-    def update_y_and_obs(self, action):
-        '''One Euler step.'''
+    
+    def update_y(self):
+        '''One Euler step of the system.'''
         # Computation of (E, M, F, Ms)(t+dt) with with explicit Euler
         new_emfs = self.y[:4] + self.dt * self.dynamics(self.y)
 
-        # Computation of u(t+dt) 
-        new_u    = self.u_fct(self.t, self.y[:4]) 
+        # Computation of u(t+dt) = k(t+dt, y(t+dt))  
+        new_u    = self.u_fct(self.t, new_emfs) 
 
         # Rebuild full state (E, M, F, Ms, u)(t+dt)
         self.y   = np.append(new_emfs, new_u)
 
-        #### Update the observer ####
+    def update_y_hat(self, action): 
+        """Update the observer. Used in env.py, not in step."""
         self.y_hat = action # Direct approximation of the state : y_hat = action 
 
     def step(self, action, store=False):
@@ -172,16 +175,18 @@ class SimODE_v2:
                Keep False during training to avoid memory growth on long
                episodes (100k+ steps per episode).
         """
-        # Increment time
+
+        # increment time
         self.t += self.dt
-        self.update_y_and_obs(action)
+        self.update_y()
+        self.update_y_hat(action)  # ← y_hat mis à jour à chaque pas
 
         # save for later plotting/metrics only when requested
         if store:
             self.t_lst.append(self.t)
             self.y_lst.append(np.copy(self.y))
             self.y_hat_lst.append(np.copy(self.y_hat))
-
+    
     def simulate(self, n_steps):
         """Simulates the dynamics of the system. Used in tests to see the chosen control acting."""
         for _ in range(n_steps):
@@ -212,17 +217,101 @@ class SimODE_v2:
  
     def get_obs(self):
         """Get the observations of the systems. 
-        (History) Hisotrics of observations can be added. The order of how
+        (History) Historics of observations can be added. The order of how
         it is added makes no difference for SB3 RL algorithm."""
         # Large scalling to have precise knowledge of observers. 
         state = []
 
         y = self.y
+        y_hat = self.y_hat
 
         # Time t
         if self.obs_time:
             state.append(self._get_time_obs())
 
+        # Observer
+        if self.obs_y_hat: 
+            if self.action_only_E:
+                e_hat = y_hat[0]
+
+                if self.obs_multi_scaling:
+                    state.append(normalize(min(e_hat, 10 * self.K), 0, 10 * self.K))
+                    state.append(normalize(min(e_hat, self.K),      0, self.K))
+                    state.append(normalize(min(e_hat, 5000),        0, 5000))
+                    state.append(normalize(min(e_hat, 500),         0, 500))
+                    state.append(normalize(min(e_hat, 50),          0, 50))
+                    state.append(normalize(min(e_hat, 5),           0, 5))
+                else:
+                    state.append(normalize(e_hat, 0, 2 * self.K))
+            elif self.action_only_EMF:
+                e_hat , m_hat , f_hat = y_hat[0], y_hat[1], y_hat[2]
+
+                if self.obs_multi_scaling:
+                    state.append(normalize(min(e_hat , 10 * self.K), 0, 10 * self.K))
+                    state.append(normalize(min(e_hat , self.K),      0, self.K))
+                    state.append(normalize(min(e_hat , 5000),        0, 5000))
+                    state.append(normalize(min(e_hat , 500),         0, 500))
+                    state.append(normalize(min(e_hat , 50),          0, 50))
+                    state.append(normalize(min(e_hat , 5),           0, 5))
+
+                    state.append(normalize(min(m_hat , 10 * self.K), 0, 10 * self.K))
+                    state.append(normalize(min(m_hat , self.K),      0, self.K))
+                    state.append(normalize(min(m_hat , 5000),        0, 5000))
+                    state.append(normalize(min(m_hat , 500),         0, 500))
+                    state.append(normalize(min(m_hat , 50),          0, 50))
+                    state.append(normalize(min(m_hat , 5),           0, 5))
+
+                    state.append(normalize(min(f_hat, 10 * self.K), 0, 10 * self.K))
+                    state.append(normalize(min(f_hat, self.K),      0, self.K))
+                    state.append(normalize(min(f_hat, 5000),        0, 5000))
+                    state.append(normalize(min(f_hat, 500),         0, 500))
+                    state.append(normalize(min(f_hat, 50),          0, 50))
+                    state.append(normalize(min(f_hat, 5),           0, 5))
+                else:
+                    state.append(normalize(e_hat , 0, 2 * self.K))
+                    state.append(normalize(m_hat , 0, 2 * self.K))
+                    state.append(normalize(f_hat, 0, 5 * self.K))
+            else: # Case with  y_hat = (E_hat, M_hat, F_hat, Ms_hat)
+                e_hat , m_hat , f_hat, ms_hat = y_hat[0], y_hat[1], y_hat[2], y_hat[3]
+
+                if self.obs_multi_scaling:
+                    state.append(normalize(min(e_hat , 10 * self.K), 0, 10 * self.K))
+                    state.append(normalize(min(e_hat , self.K),      0, self.K))
+                    state.append(normalize(min(e_hat , 5000),        0, 5000))
+                    state.append(normalize(min(e_hat , 500),         0, 500))
+                    state.append(normalize(min(e_hat , 50),          0, 50))
+                    state.append(normalize(min(e_hat , 5),           0, 5))
+
+                    state.append(normalize(min(m_hat , 10 * self.K), 0, 10 * self.K))
+                    state.append(normalize(min(m_hat , self.K),      0, self.K))
+                    state.append(normalize(min(m_hat , 5000),        0, 5000))
+                    state.append(normalize(min(m_hat , 500),         0, 500))
+                    state.append(normalize(min(m_hat , 50),          0, 50))
+                    state.append(normalize(min(m_hat , 5),           0, 5))
+
+                    state.append(normalize(min(f_hat, 10 * self.K), 0, 10 * self.K))
+                    state.append(normalize(min(f_hat, self.K),      0, self.K))
+                    state.append(normalize(min(f_hat, 5000),        0, 5000))
+                    state.append(normalize(min(f_hat, 500),         0, 500))
+                    state.append(normalize(min(f_hat, 50),          0, 50))
+                    state.append(normalize(min(f_hat, 5),           0, 5))
+
+                    state.append(normalize(ms_hat, 0, 100 * self.K))
+                    state.append(normalize(min(ms_hat, 50 * self.K), 0, 50 * self.K))
+                    state.append(normalize(min(ms_hat, 10 * self.K), 0, 10 * self.K))
+                    state.append(normalize(min(ms_hat, self.K),      0, self.K))
+                    state.append(normalize(min(ms_hat, 5000),        0, 5000))
+                    state.append(normalize(min(ms_hat, 500),         0, 500))
+                    state.append(normalize(min(ms_hat, 50),          0, 50))
+                    state.append(normalize(min(ms_hat, 5),           0, 5))
+                else:
+                    state.append(normalize(e_hat , 0, 2 * self.K))
+                    state.append(normalize(m_hat , 0, 2 * self.K))
+                    state.append(normalize(f_hat, 0, 5 * self.K))
+                    state.append(normalize(ms_hat, 0, 50 * self.K))
+                
+
+        # Ohter
         if self.obs_E_state:
             e_obs = y[0]
 
@@ -313,18 +402,11 @@ class SimODE_v2:
             reward += r
 
         if self.rwd_y123 > 0:
-            if self.action_only_E:
+            if self.n_action < 3:
                 raise ValueError("rwd_y123 requires at least 3 observed components (action_only_EMF or full mode)")
             diff_state_obs = self.y[:3] - self.y_hat[:3]
-            r = -self.rwd_y1 * np.linalg.norm(diff_state_obs) / self.K
+            r = -self.rwd_y123 * np.linalg.norm(diff_state_obs) / self.K
             reward_info["rwd_y123"] = r
-            reward += r
-
-        if self.rwd_y4 > 0:
-            if self.action_only_E or self.action_only_EMF:
-                raise ValueError("rwd_y4 requires the full 4-component observer")
-            r = -self.rwd_y1 * np.linalg.norm(self.y[3]-self.y_hat[3]) / self.K
-            reward_info["rwd_y4"] = r
             reward += r
 
         return reward, reward_info

@@ -77,7 +77,7 @@ def choose_u(u_types, umax = None, period_random_ctrl=None, tmax = None, instanc
         case "u=kF":
             k_F = choose_k_F()
             ctrl_fct = lambda t, EMFMs: k_F*EMFMs[2]
-        case "resurgence_lin_deterministic":
+        case "res_lin_det":
             # control that allows resurgence but with fixed deterministic thresholds. Used to test 
             # the RL model on approximation of identity E -> E.  Always taken with feedback in F.
 
@@ -90,7 +90,7 @@ def choose_u(u_types, umax = None, period_random_ctrl=None, tmax = None, instanc
             ctrl_fct = lambda t, EMFMs: resurgence_lin_ctrl(
                 t, EMFMs, threshold_inf, threshold_sup, instance_ODE_model, k, idx_state)
             
-        case "resurgence_lin":
+        case "res_lin":
             # control that allows resurgence but with non-deterministic thresholds to aloow diversity.
 
             # choice of the linear control

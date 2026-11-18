@@ -84,12 +84,8 @@ class TensorboardCallback(BaseCallback):
 
     def _on_rollout_end(self):
         try:
-            rewards = []
-            env_times = [0.0]
-            reward_infos = defaultdict(list)
-
             # reset de l'environnement d'évaluation
-            obs, _ = self.eval_env.reset()
+            _, _ = self.eval_env.reset()
 
             # forcer le stockage du point initial
             self.eval_env.sim.t_lst = [self.eval_env.sim.t]
@@ -98,35 +94,16 @@ class TensorboardCallback(BaseCallback):
 
             gamma = self.model.gamma
 
-            state = obs
-            done = False
-            while not done:
-                # pas d'update de info["TimeLimit.truncated"] : pas de bootstrapping car on simule tout l'épisode 
-                action, _ = self.model.predict(state, deterministic=True)
-
-                # action normalisée vers l'échelle physique [E_hat, M_hat, F_hat, Ms_hat]
-                scaled = self.eval_env.normalize_action(action)
-
-                # stepping manuel pour conserver t_lst/y_lst/y_hat_lst
-                for _ in range(self.eval_env.n_steps_per_action):
-                    self.eval_env.sim.step(scaled, store=True)
-
-                state = self.eval_env.get_state(append_to_memory=True)
-                reward, reward_info = self.eval_env.compute_reward(scaled)
-
-                terminated = self.eval_env.sim.t >= self.eval_env.tmax
-                truncated = self.eval_env.sim.norm_y() > 1000 * self.eval_env.sim.K
-                done = terminated or truncated
-
-                rewards.append(reward)
-                env_times.append(self.eval_env.sim.t)
-                for k, v in reward_info.items():
-                    reward_infos[k].append(v)
+            result = self.eval_env.run_episode(self.model, deterministic=True)
+            rewards = result["rewards"]
+            t_lst, y_lst, y_hat_lst = result["t"], result["Y"], result["Y_hat"]
+            env_times = np.copy(result["t_rewards"])
+            reward_infos = result["reward_infos"]
 
             rewards = np.array(rewards)
             t_lst = np.array(self.eval_env.sim.t_lst)
-            y_lst = np.array(self.eval_env.sim.y_lst)         # shape (T, 5) : [E, M, F, Ms, u]
-            y_hat_lst = np.array(self.eval_env.sim.y_hat_lst)  # shape (T, 4) : [E_hat, M_hat, F_hat, Ms_hat]
+            y_lst = np.array(self.eval_env.sim.y_lst)         # shape (T, 5) : [E, M, F, Ms, u] 
+            y_hat_lst = np.array(self.eval_env.sim.y_hat_lst)  # shape (T, 4) : [E_hat, M_hat, F_hat, Ms_hat] or [E, M, F] or [E]
             K = self.eval_env.sim.K
 
             # discounted reward gamma^t * r_t (t indexé sur les actions, pas le temps physique)
@@ -244,19 +221,24 @@ class TensorboardCallback(BaseCallback):
 
             # ── PLOT BREAKDOWN RÉCOMPENSES ────────────────────────────
             if reward_infos:
-                n_min = min(len(v) for v in reward_infos.values())
-                reward_infos_trimmed = {k: v[:n_min] for k, v in reward_infos.items()}
-                plot('rewards_breakdown_by_t', env_times[1:n_min + 1],
-                    reward_infos_trimmed,
+                # Trim in case 
+                # n_min = min(len(v) for v in reward_infos.values())
+                # reward_infos_trimmed = {k: v[:n_min] for k, v in reward_infos.items()}
+                # plot('rewards_breakdown_by_t', env_times[0:n_min + 1],
+                #     reward_infos_trimmed,
+                #     xlabel='t', ylabel='r_i(t)',
+                #     title='Breakdown of reward components by time')
+                plot('rewards_breakdown_by_t', env_times,
+                    reward_infos,
                     xlabel='t', ylabel='r_i(t)',
                     title='Breakdown of reward components by time')
                 
             # Reward globale r_t
-            plot('r_by_t', env_times[1:], {'r': rewards},
+            plot('r_by_t', env_times, {'r': rewards},
                 xlabel='t', ylabel='r(t)', title='Reward by time', legend=False)
 
             # Reward actualisée gamma^t * r_t
-            plot('discounted_r_by_t', env_times[1:], {'gamma^t * r_t': discounted_rewards},
+            plot('discounted_r_by_t', env_times, {'gamma^t * r_t': discounted_rewards},
                 xlabel='t', ylabel='gamma^t * r(t)',
                 title='Discounted reward by time', legend=False)
                 

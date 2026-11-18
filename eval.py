@@ -83,6 +83,13 @@ parser.add_argument(
     help="Probability distribution of used controls",
 )
 
+parser.add_argument(
+    "--tmax",
+    type=float,
+    default=None,
+    help='Duration (in time) of one episode for the evaluation.',
+)
+
 
 args = parser.parse_args()
 
@@ -102,38 +109,10 @@ def _run_episode(sim_idx):
     """Runs a single episode using the worker-local model and env. Creates a fresh env
     instance per episode (lightweight) while reusing the pre-loaded model (expensive)."""
     _env = RL_env(**_worker_env_kwargs)
-
-    obs, _ = _env.reset()
-    done   = False
-    step   = 0
-    rewards, t_rewards = [], []
-
-    while not done and step < MAX_STEPS:
-        action, _ = _worker_model.predict(obs, deterministic=True)
-        scaled = _env.normalize_action(action)
-
-        for _ in range(_env.n_steps_per_action):
-            _env.sim.step(scaled, store=True)
-
-        obs = _env.get_state(append_to_memory=True)
-        reward, _ = _env.compute_reward(scaled)
-        terminated = _env.sim.t >= _env.tmax
-        truncated  = _env.sim.norm_y() > 1000 * _env.sim.K
-
-        if truncated:
-            reward -= 100
-
-        done = terminated or truncated
-        step += 1
-        rewards.append(reward)
-        t_rewards.append(_env.sim.t)
-
+    result = _env.run_episode(_worker_model, deterministic=True, max_steps=MAX_STEPS, tmax=args.tmax)
     return {
-        "t":         np.array(_env.sim.t_lst),
-        "Y":         np.array(_env.sim.y_lst),
-        "Y_hat":     np.array(_env.sim.y_hat_lst),
-        "rewards":   rewards,
-        "t_rewards": t_rewards,
+        "t": result["t"], "Y": result["Y"], "Y_hat": result["Y_hat"],
+        "rewards": result["rewards"], "t_rewards": result["t_rewards"],
     }
 
 def _collect_episodes_parallel(n_sims, model_path_str, env_kwargs,
@@ -440,9 +419,9 @@ if __name__ == "__main__":
                 env_kwargs["sim_kwargs"]["u_types"] = parsed
 
 
-        ctrl_dict = env_kwargs["sim_kwargs"]["u_types"]
-        foldername_ctrl_type =  "_".join(f"{k}-{v}" for k, v in sorted(ctrl_dict.items()))
-        print(f"(DEBUG) ctrl file filename: {foldername_ctrl_type}")
+    ctrl_dict = env_kwargs["sim_kwargs"]["u_types"]
+    foldername_ctrl_type =  "_".join(f"{k}-{v}" for k, v in sorted(ctrl_dict.items()))
+    print(f"(DEBUG) ctrl file filename: {foldername_ctrl_type}")
     
     # Env creation
     env = RL_env(**env_kwargs)
@@ -490,12 +469,14 @@ if __name__ == "__main__":
     title_plot_traj = model_label + f" -- trajectoires sur {n_traj} épisodes"
     title_plot_hist = model_label + f" -- métriques sur {n_hist} épisodes"
 
+    #Different tmax
+    tmax_title = "T_default" if args.tmax is None else f"T_{args.tmax}"
     if "checkpoints" in str(model_path):
-        title_folder = Path(folder_name + "_plot") / f"checkpoints_{n_steps_cp}"
+        title_folder = Path(folder_name + "_plot") / tmax_title / f"checkpoints_{n_steps_cp}"
     elif "best_model" in str(model_path):
-        title_folder = Path(folder_name + "_plot") / "best_model"
+        title_folder = Path(folder_name + "_plot") / tmax_title / "best_model"
     else:
-        title_folder = Path(folder_name + "_plot") / "final_model"
+        title_folder = Path(folder_name + "_plot") / tmax_title / "final_model"
 
     title_folder = title_folder / foldername_ctrl_type
 
