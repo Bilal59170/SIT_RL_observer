@@ -1,18 +1,15 @@
-'''Evaluation of the model by computing trajectories plots and convergence histograms with several CPUs
- if specified in the n_workers variable.
-
+'''
 Typical command line: 
-    "python eval.py logs/train_saved/big_trainings/G5/1782634159_pid24196_28Jun26_10h09m19s/best_model/best_model.zip --n_workers 5"
+    python eval.py logs/train_saved/big_trainings/G5/1782634159_pid24196_28Jun26_10h09m19s/best_model/best_model.zip --n_workers 2 --observer_mode "luenberger_partial" 
     
 with 
 - n_traj (=10 by default): number of trajectories plotted
 - n_hist (=200 by default): number of occurences in the histogram
 - n_workers: number of CPUs that works in parallel
 
-Parallelism: episode collection is distributed across all available CPU cores using
-multiprocessing.Pool. Each worker loads its own copy of the model and env to avoid
-shared-state issues across processes. Plotting and file saving happen in the main process,
-preserving the original directory structure and naming conventions exactly.
+Parallelism: Evaluation of the model by computing trajectories plots and convergence histograms with several CPUs
+if specified in the n_workers variable. episode collection is distributed across all available CPU cores using
+multiprocessing.Pool. 
 '''
 
 import numpy as np
@@ -24,6 +21,7 @@ import json
 from tqdm import tqdm
 from env import RL_env
 from utils import parse_env_args
+from collections import defaultdict
 
 import os
 from copy import deepcopy
@@ -82,13 +80,86 @@ parser.add_argument(
     help='Duration (in time) of one episode for the evaluation.',
 )
 
+parser.add_argument(
+    "--observer_mode",
+    type=str,
+    default="direct",
+    choices=["direct", "luenberger_full", "luenberger_partial"],
+    help="Mode de l'observateur de SimODE_v2 (doit correspondre à celui utilisé à l'entraînement).",
+)
 
 args = parser.parse_args()
-
+bool_luenberger_partial = (args.observer_mode == "luenberger_partial")
 
 # ---------------------------------------------------------------------------
 # Module-level worker function (must be picklable for multiprocessing)
 # ---------------------------------------------------------------------------
+
+def run_episode_with_L(env, model, deterministic=True, max_steps=None, store=True, tmax=None):
+    """Same as RL_env.run_episode(), but store the gain matrix trajectory too (SimODE_v2, Luenberger modes).
+    Returns None for "L"/"t_L" if model.observer_mode = "direct".
+    """
+    obs, _ = env.reset()
+    tmax = tmax if tmax is not None else env.tmax
+
+    state = obs
+    done = False
+    step = 0
+    rewards, t_rewards = [], []
+    L_list, t_L = [], []
+    reward_infos = defaultdict(list)
+    terminated = truncated = False
+
+    while not done and (max_steps is None or step < max_steps):
+        action, _ = model.predict(state, deterministic=deterministic)
+        action = env.normalize_action(action)
+
+        if env.on_time_reward:
+            env.sim.update_y_hat(action)
+            reward, reward_info = env.compute_reward()
+            rewards.append(reward)
+            t_rewards.append(env.sim.t)
+            for k, v in reward_info.items():
+                reward_infos[k].append(v)
+            for _ in range(env.n_steps_per_action):
+                env.sim.step(action, store=store)
+            state = env.get_state()
+        else:
+            for _ in range(env.n_steps_per_action):
+                env.sim.step(action, store=store)
+            state = env.get_state()
+            reward, reward_info = env.compute_reward()
+            rewards.append(reward)
+            t_rewards.append(env.sim.t)
+            for k, v in reward_info.items():
+                reward_infos[k].append(v)
+
+        # L is constant throughout the action step
+        if getattr(env.sim, "last_L", None) is not None:
+            L_list.append(np.copy(env.sim.last_L).flatten())
+            t_L.append(env.sim.t)
+
+        terminated = env.sim.norm_y() > 1000 * env.sim.K
+        truncated = env.sim.t >= tmax
+
+        if terminated:
+            rewards[-1] -= 100
+
+        done = terminated or truncated
+        step += 1
+
+    return {
+        "t": np.array(env.sim.t_lst),
+        "Y": np.array(env.sim.y_lst),
+        "Y_hat": np.array(env.sim.y_hat_lst),
+        "rewards": np.array(rewards),
+        "t_rewards": np.array(t_rewards),
+        "reward_infos": dict(reward_infos),
+        "terminated": terminated,
+        "truncated": truncated,
+        "L": np.array(L_list) if len(L_list) > 0 else None,
+        "t_L": np.array(t_L) if len(t_L) > 0 else None,
+    }
 
 def _worker_init(model_path_str, env_kwargs):
     """Called once per worker process at pool creation. Loads the model and stores
@@ -101,10 +172,14 @@ def _run_episode(sim_idx):
     """Runs a single episode using the worker-local model and env. Creates a fresh env
     instance per episode (lightweight) while reusing the pre-loaded model (expensive)."""
     _env = RL_env(**_worker_env_kwargs)
-    result = _env.run_episode(_worker_model, deterministic=True, max_steps=MAX_STEPS, tmax=args.tmax)
+
+    # Make control "cycle_stab_nonstab_reslin" déterminist per episodes. No effect on other controls
+    _env.sim.forced_cycle_phase = sim_idx % 3
+    result = run_episode_with_L(_env, _worker_model, deterministic=True, max_steps=MAX_STEPS, tmax=args.tmax)
     return {
         "t": result["t"], "Y": result["Y"], "Y_hat": result["Y_hat"],
         "rewards": result["rewards"], "t_rewards": result["t_rewards"],
+        "L": result["L"], "t_L": result["t_L"],
     }
 
 def _collect_episodes_parallel(n_sims, model_path_str, env_kwargs,
@@ -131,32 +206,32 @@ def _collect_episodes_parallel(n_sims, model_path_str, env_kwargs,
 # ---------------------------------------------------------------------------
 
 def get_convergence_time(array_t, error_array, eps):
-    """Renvoit le premier temps à partir duquel l'erreur reste sous eps, ou None."""
+    """ Return the first time from which the error is below eps, or None."""
     condition = error_array < eps
 
-    assert not np.isnan(error_array).any(), "error_array contient des NaN"
-    assert (error_array >= 0).all(), "error_array contient des valeurs négatives"
+    assert not np.isnan(error_array).any(), "error_array has NaN"
+    assert (error_array >= 0).all(), "error_array has negative valuers"
 
     for i in range(len(condition) - 1, -1, -1):
-        if not condition[i]: # la variable au temps array_t[i] est > eps
-            if i + 1 < len(array_t):  # Le temps de convergence est au temps d'après (s'il existe)
+        if not condition[i]: # the variable at time array_t[i] is > eps
+            if i + 1 < len(array_t):  # Convergence time is after (if it exists)
                 return array_t[i + 1]
             else:
-                return None # La condition n'est jamais atteinte définitivement
-    # Tous les points vérifient la condition : convergence dès le début
+                return None # Condition is never meet
+    # Convergence at the beginning
     return array_t[0]
 
 def worst_null_observer(obs_array, state_array, min_value_obs):
-    """Donne le pire cas où l'observateur s'annule (i.e vaut min_value_obs) :
-      Correspond à la valeur max de l'état du système aux instants où 
-      l'observateur donné par le RL sature en obs = min_value_obs ."""
+    """Give the worst case where the observer nulifies (i.e equals to min_value_obs) :
+      Corresponds to the maximum value of the system state when the 
+      RL observer saturates at obs = min_value_obs."""
     obs_array = np.asarray(obs_array)
     state_array = np.asarray(state_array)
 
     if obs_array.shape[0] == 0 or state_array.shape[0] == 0:
         return None
-    assert obs_array.shape == state_array.shape, "obs_array et state_array doivent avoir la même longueur"
-    assert not np.isnan(obs_array).any() and not np.isnan(state_array).any(), "NaN détecté dans obs_array ou state_array"
+    assert obs_array.shape == state_array.shape, "obs_array and state_array have to have same length"
+    assert not np.isnan(obs_array).any() and not np.isnan(state_array).any(), "NaN detected in obs_array or state_array"
 
     eps = 1e-12
     mask = obs_array <= min_value_obs + eps
@@ -182,11 +257,11 @@ def plot_trajectories(results, env, configs,
     "#4daf4a",  # vert
     "#984ea3",  # violet
     "#ff7f00",  # orange
+    "#bcbd22",  # olive
     "#ffff33",  # jaune
     "#a65628",  # marron
     "#f781bf",  # rose
     "#17becf",  # cyan
-    "#bcbd22",  # olive
     ]
 
     if len(results) > len(colors):
@@ -246,6 +321,47 @@ def plot_trajectories(results, env, configs,
         save_dir = os.path.join("plot_eval_train", title_folder)
         os.makedirs(save_dir, exist_ok=True)
         fig.savefig(os.path.join(save_dir, "trajectoires.png"))
+
+    if show_plot:
+        plt.show()
+
+def plot_L_trajectories(results, n_traj,
+                         show_plot=True, save_plot=False, title_folder=None):
+    """
+    2x2 Figure of the trajectories of 4 coefficients of the gain matrix L 
+    (observer_mode="luenberger_partial, L of size 4x1). Use the same episodes 
+    (so same colours) as plot_trajectories. 
+    """
+    colors = [
+        "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
+        "#bcbd22","#ffff33", "#a65628", "#f781bf", "#17becf",
+    ]
+    if len(results) > len(colors):
+        raise ValueError(f"Too many results ({len(results)}) for available colors ({len(colors)}).")
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    positions = [(0, 0), (0, 1), (1, 0), (1, 1)]  # L1, L2, L3, L4
+    labels = [r'$L_E$', r'$L_M$', r'$L_F$', r'$L_{M_s}$']
+
+    for k, res in enumerate(results):
+        if res.get("L", None) is None:
+            continue
+        color = colors[k]
+        t_L = res["t_L"]
+        array_L = res["L"]  # shape (n_pas_macro, 4)
+        for i, (row, col) in enumerate(positions):
+            axes[row, col].plot(t_L, array_L[:, i], color=color)
+            if i == 2 or i == 3:
+                axes[row, col].set_xlabel("Temps (jours)", fontsize=14)
+            axes[row, col].tick_params(axis='both', labelsize=14)
+            axes[row, col].set_title(labels[i], fontsize=20, fontweight='bold')
+
+    fig.tight_layout(pad=0.5, h_pad=0.8, w_pad=0.5)
+
+    if save_plot:
+        save_dir = os.path.join("plot_eval_train", title_folder)
+        os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(os.path.join(save_dir, "L_coefficients.png"))
 
     if show_plot:
         plt.show()
@@ -470,7 +586,7 @@ if __name__ == "__main__":
 
     title_folder = title_folder / foldername_ctrl_type
 
-    # print("DEBUG: ", title_folder)
+    print("DEBUG: ", title_folder)
 
 
     # ---------------------------------------------------------------------------
@@ -504,6 +620,13 @@ if __name__ == "__main__":
         show_plot=False, save_plot=True,
         title_folder=title_folder, title_plot=title_plot_traj,
     )
+
+    if bool_luenberger_partial:
+        plot_L_trajectories(
+            traj_results, n_traj=n_traj,
+            show_plot=False, save_plot=True,
+            title_folder=title_folder,
+        )
 
     plot_histograms(
         hist_results, env=env, n_sims=n_hist,

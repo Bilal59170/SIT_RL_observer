@@ -22,14 +22,22 @@ def normalize(x, xmin, xmax):
 
 
 class SimODE_v2:
-    """Classe de simulation pour construire un observateur avec du Reinforcement Learning 
-    avec plusieurs type de contrôles différents. Version moins lourde de ODE_model_old.py sans
-      les features infructueuses pendant les entraînements comme la reward relative rwd_y_relat."""
+    """Simulation class to build an observer with Reinforcement Learning. Uses different controls.
+    Last version of the ODE_model classes (SimODE_old, SimODE_v1, SimODE_v2)
+
+    3 observation modes ("observer_mode" attribute): 
+    - observer_mode="direct" : action = observer. (action of size 4)
+    - observer_mode="luenberger_full" : total observation  y = x (C = Id_4).
+            L is 4x4 matrix (action of size 16, flattened).
+    - observer_mode="luenberger_partial" -> partial observation y = E (C = [1,0,0,0]).
+            L is 4x1 matrix (action of size 4).
+    """
     def __init__(
         self,
         u_types : dict,
         dt, 
         tmax, 
+        obs_multi_scaling = True,
         rwd_y1=0,
         rwd_y123=0, 
         rwd_y4=0, 
@@ -50,6 +58,7 @@ class SimODE_v2:
         action_only_E=False, # Output
         action_only_EMF=False,
         min_value_obs=0, # minimal value authorized for the observer 
+        observer_mode="direct", # "direct", "luenberger_full" ou "luenberger_partial"
 
         # History
         y_period_history=None,
@@ -90,16 +99,47 @@ class SimODE_v2:
         # State
         self.n_state = 4
 
-        # Action
+        # Action / observer mode 
         self.action_only_E = action_only_E
         self.action_only_EMF = action_only_EMF
-        if self.action_only_E:
-            self.n_action = 1 # Only E_hat to output
-        elif self.action_only_EMF:
-            self.n_action = 3
-        else:
-            self.n_action = 4
+        self.observer_mode = observer_mode
+        valid_modes = ("direct", "luenberger_full", "luenberger_partial")
+        if self.observer_mode not in valid_modes:
+            raise ValueError(f"observer_mode doit être parmi {valid_modes}, reçu {observer_mode!r}.")
+
+        if self.observer_mode == "direct":
+            # action = y_hat
+            if self.action_only_E:
+                self.n_action = 1 # Only E_hat to output
+            elif self.action_only_EMF:
+                self.n_action = 3
+            else:
+                self.n_action = 4
+            self.n_xhat = self.n_action
+        elif self.observer_mode == "luenberger_full":
+            # Full observation y = x (C = Id_4) : action = L (4x4) flattened.
+            self.n_action = 4 * self.n_state  # 16
+            # Observer approximate the full state (E, M, F, Ms).
+            self.n_xhat = self.n_state
+        elif self.observer_mode == "luenberger_partial":
+            # Partial observation y = E (C = [1,0,0,0]) : action = L (4x1) flattened.
+            self.n_action = self.n_state  # 4
+            self.n_xhat = self.n_state
+
         self.min_value_obs = min_value_obs
+        self.last_L = None  # last gain matrix used (Luenberger modes)
+
+        # Security bounds on y_hat (Luenberger modes only) to prevent overflow (Nans) 
+        # noticed at the beginning of the training
+        self.xhat_clip = np.array([10*self.K, 10 * self.K, 10 * self.K, 100 * self.K])
+
+        # Linear part of the dynamics
+        self.A_lin = np.array([
+            [-(self.delta_E + self.nu_E), 0.0,                 0.0,           0.0],
+            [(1 - self.nu) * self.nu_E,   -self.delta_M,       0.0,           0.0],
+            [self.nu * self.nu_E,          0.0,               -self.delta_F,  0.0],
+            [0.0,                          0.0,                0.0,          -self.delta_s],
+        ])
 
         # Historics
         if y_period_history is not None and not (self.obs_E_state) : 
@@ -119,9 +159,9 @@ class SimODE_v2:
         self.length_y_hat_history = length_y_history  # same length as y_history
         self.next_y_hat_time = np.inf
         self._y_hat_history = None # initilised in reset()
-        # error error_obs_obs = y_hat - y (erreur de l'observateur avec observation totale)
+        # error error_obs_obs = y_hat - y (error of the observer with full observation)
         self.length_error_obs_history = length_y_history
-        self._error_obs_history = None  # initialisé dans reset()
+        self._error_obs_history = None  # initialised in reset()
         self.next_error_obs_time = np.inf
 
 
@@ -131,7 +171,7 @@ class SimODE_v2:
         # Set the control function
         self.u_fct, self.current_u_type = choose_u(u_types, instance_ODE_model=self)
 
-        # Etat de la simulation (valeurs reelles assignees dans reset(), ci-dessous)
+        # Other attributes (initialized in reset)
         self.t = None
         self.y = None
         self.y_hat = None
@@ -167,8 +207,9 @@ class SimODE_v2:
         # Initializes u with u(E, M, F, Ms, t=0)
         self.y = np.array([*emfms, self.u_fct(t=0, EMFMs=emfms)]) # full state of the system
         
-        # Initializes randomly the observer that is constructed with reinforcement learning: (E, M, F, Ms) hat or (E, M, F) or (E)
-        self.y_hat = np.random.uniform(low=0.0, high= self.factor_K * self.K, size=(self.n_action)) 
+        # Initializes randomly the observer xhat.
+        self.y_hat = np.random.uniform(low=0.0, high= self.factor_K * self.K, size=(self.n_xhat))
+        self.last_L = None
         self.t_lst = [self.t]
         self.y_lst = [np.copy(self.y)]
         self.y_hat_lst = [np.copy(self.y_hat)]
@@ -187,8 +228,7 @@ class SimODE_v2:
         self.next_u_time = self.next_y_time
 
         # y_hat
-        # ATTENTION : contrairement à E (scalaire), y_hat est un np.array mutable donc on utilise 
-        # np.copy() distinct pour éviter les dépendences entre les élements de l'historique.
+        # ATTENTION : unlike E (scalar), y_hat is mutable we use np.copy to avoid dependencies in the historic
         self._y_hat_history = deque(
             [np.copy(self.y_hat) for _ in range(self.length_y_hat_history)],
             maxlen=self.length_y_hat_history
@@ -199,7 +239,7 @@ class SimODE_v2:
         if self.obs_E_state:
             error_obs_0 = np.array([self.y_hat[0] - self.y[0]]) # error on E only
         else:
-            error_obs_0 = self.y_hat - self.y[:self.n_action] # error on all observed components
+            error_obs_0 = self.y_hat - self.y[:self.n_xhat] # error on all observed components
         self._error_obs_history = deque(
             [np.copy(error_obs_0) for _ in range(self.length_error_obs_history)],
             maxlen=self.length_error_obs_history
@@ -223,20 +263,102 @@ class SimODE_v2:
         dMs_dt = u - self.delta_s * Ms
 
         return np.array([dE_dt, dM_dt, dF_dt, dMs_dt])
-    
+
+    ##################################################
+    # Observateur de Luenberger (modes non observer_mode != "direct")
+    ##################################################
+
+    def _safe_mating_ratio(self, M, Ms):
+        """Computes M/(M + gamma_s*Ms) with numerical safeguards. 
+        Usefull when M and M_s are close to 0
+        """
+        denom = M + self.gamma_s * Ms
+        eps = 1e-6 * max(self.K, 1.0)
+        if abs(denom) <= eps:
+            return 0.0
+        ratio = M / denom
+        if not np.isfinite(ratio):
+            return 0.0
+        return float(np.clip(ratio, 0.0, 1.0))
+
+    def _action_to_L(self, action):
+        """Turns the RL action into a gain matrix  L.
+
+        - observer_mode == "luenberger_full"    : action size 16 -> L (4,4)
+        - observer_mode == "luenberger_partial" : action size 4  -> L (4,1)
+        """
+        action = np.asarray(action, dtype=float).flatten()
+        if self.observer_mode == "luenberger_full":
+            if action.size != 4 * self.n_state:
+                raise ValueError(
+                    f"action de taille {action.size}, attendu {4 * self.n_state} "
+                    "(matrice L 4x4 aplatie) en mode luenberger_full."
+                )
+            return action.reshape(self.n_state, self.n_state)
+        elif self.observer_mode == "luenberger_partial":
+            if action.size != self.n_state:
+                raise ValueError(
+                    f"action de taille {action.size}, attendu {self.n_state} "
+                    "(matrice L 4x1 aplatie) en mode luenberger_partial."
+                )
+            return action.reshape(self.n_state, 1)
+        else:
+            raise ValueError(
+                f"_action_to_L ne doit être appelé qu'en mode Luenberger (observer_mode={self.observer_mode!r})."
+            )
+
+    def _rhs_luenberger_full(self, y_hat, y_true, u, L):
+        """rhs = "right hand side". 
+        Corresponds to xhat_dot for the full observation case y = x (C = Id_4).
+
+        xhat_dot = A xhat + g(y, u) + L (xhat - y)
+
+        g : non linearities +  control
+        """
+        E, M, F, Ms = y_true[:4]
+        mating = self._safe_mating_ratio(M, Ms)
+        carrying_factor = np.clip(1 - E / self.K, -10.0, 10.0)
+        F_clipped = np.clip(F, -10.0 * self.K, 10.0 * self.K)
+        g = np.array([
+            self.beta_E * F_clipped * carrying_factor * mating,
+            0.0,
+            0.0,
+            u,
+        ])
+        # C = Id_4 donc C @ y_hat - y = y_hat - y_true
+        correction = L @ (y_hat - y_true[:4])
+        return self.A_lin @ y_hat + g + correction
+
+    def _rhs_luenberger_partial(self, y_hat, y_true, u, L):
+        """rhs = "right hand side". 
+        xhat_dot for the cas of partial observations y = E (C = [1,0,0,0]).
+
+        xhat_dot = A xhat + B(f(xhat)) + D u + L (C xhat - y)
+        """
+        E_hat, M_hat, F_hat, Ms_hat = y_hat
+        mating = self._safe_mating_ratio(M_hat, Ms_hat)
+        # (1 - E_hat/K) est clippé pour éviter un overflow
+        carrying_factor = np.clip(1 - E_hat / self.K, -10.0, 10.0)
+        F_hat_clipped = np.clip(F_hat, -10.0 * self.K, 10.0 * self.K)
+        f_val = self.beta_E * F_hat_clipped * carrying_factor * mating
+        Bf = np.array([f_val, 0.0, 0.0, 0.0])
+        Du = np.array([0.0, 0.0, 0.0, u])
+
+        E_true = y_true[0]
+        error_scalar = E_hat - E_true
+        correction = L.flatten() * error_scalar
+
+        return self.A_lin @ y_hat + Bf + Du + correction
+
     def update_observations_aux(self, period, state, history, t, next_time):
         """Auxiliary function to update observations based on a given period.
 
-        - y_period None  : lecture instantanee a chaque appel.
-        - y_period defini : releve seulement tous les y_period jours ;
-          entre deux releves, l'agent voit la derniere valeur connue.
+        - y_period None  : instantaneous update.
+        - y_period defini : sample every y_period days ;
         """
 
-        # IMPORTANT : get_obs() lit history (pas last_obs),
-        # il faut donc alimenter la deque a chaque appel, sinon l'historique
-        # reste fige sur sa valeur d'initialisation (observation morte).
         if period is None:
-            # comportement instantane (retrocompatible avec le cas sans historique)
+            # instantaneous update (retrocompatible with the case withou historic)
             last_obs = np.copy(state)
             history.append(last_obs)
             return 
@@ -277,11 +399,11 @@ class SimODE_v2:
             self.next_u_time = next_time
 
     def update_observation_error_obs(self):
-        """Met à jour l'historique de l'erreur e = y_hat - y[:n_action]."""
+        """Update the historic of the error e = y_hat - y[:n_xhat]."""
         if self.obs_E_state:
             error_obs = np.array([self.y_hat[0] - self.y[0]]) # error on E only
         else:
-            error_obs = self.y_hat - self.y[:self.n_action] # error on all observed components
+            error_obs = self.y_hat - self.y[:self.n_xhat] # error on all observed components
         next_time = self.update_observations_aux(
             period=self.y_period_history,
             state=error_obs,
@@ -308,9 +430,38 @@ class SimODE_v2:
         self.update_observation_E() # E(t) 
         self.update_observation_u() # u(t)
 
-    def update_y_hat(self, action): 
-        """Update the observer. Used in env.py, not in step."""
-        self.y_hat = action # Direct approximation of the state : y_hat = action 
+    def update_y_hat(self, action, y_true_prev=None, u_prev=None):
+        """Update the observer. Used in env.py, not in step().
+
+        - observer_mode == "direct" : y_hat = action.
+        - observer_mode in {"luenberger_full", "luenberger_partial"} : Update of y_hat with 
+          explicit Euler with the Luenberger-like dynamics . Uses
+          (y_true_prev, u_prev) : state and control at the previous time
+        """
+        if self.observer_mode == "direct":
+            self.y_hat = action # Direct approximation of the state : y_hat = action
+        else:
+            if y_true_prev is None or u_prev is None:
+                raise ValueError(
+                    "y_true_prev and u_prev are needed for update_y_hat in Luenberger mode "
+                    "(There are given by step())."
+                )
+            L = self._action_to_L(action)
+            self.last_L = L
+
+            if self.observer_mode == "luenberger_full":
+                rhs = self._rhs_luenberger_full(self.y_hat, y_true_prev, u_prev, L)
+            elif self.observer_mode == "luenberger_partial":
+                rhs = self._rhs_luenberger_partial(self.y_hat, y_true_prev, u_prev, L)
+            else:
+                raise ValueError(f"observer_mode unknown : {self.observer_mode!r}")
+
+            self.y_hat = self.y_hat + self.dt * rhs
+            # Numerical security 
+            self.y_hat = np.nan_to_num(
+                self.y_hat, nan=0.0, posinf=self.xhat_clip, neginf=0
+            )
+            self.y_hat = np.clip(self.y_hat, 0, self.xhat_clip)
 
         # Update historic of quantities that only depend on y_hat
         self.update_observation_y_hat()
@@ -322,13 +473,16 @@ class SimODE_v2:
                Keep False during training to avoid memory growth on long
                episodes (100k+ steps per episode).
         """
+        # State and control at time t (before the update), needed in Luenberger modes
+        y_true_prev = np.copy(self.y[:4])
+        u_prev = self.y[4]
 
         # increment time
         self.t += self.dt
         self.update_y() # y(t+dt)
-        self.update_y_hat(action)  # y_hat updated
+        self.update_y_hat(action, y_true_prev=y_true_prev, u_prev=u_prev)  # y_hat updated
 
-        # Update the error error_obs_obs = y_hat - y[:n_action] for the observation
+        # Update the error error_obs_obs = y_hat - y[:n_xhat] for the observation
         self.update_observation_error_obs() 
         # save for later plotting/metrics only when requested
         if store:
@@ -343,8 +497,7 @@ class SimODE_v2:
 
     def _get_time_obs(self):
         """
-        (Reprend la fonction de Nail dans SimODEdiscreteLuis) : Retourne l'observation 
-        temporelle selon obs_time_mode.
+        (Nail Baloul's function in SimODEdiscreteLuis) : return temporal observation in obs_time_mode.
 
         "absolute"     : position dans l'episode [0, tmax]
                          -> risque open-loop si T fixe
@@ -364,7 +517,7 @@ class SimODE_v2:
             raise ValueError("obs_time_mode value is wrong. Should be \"absolute\", \"season\", or \"week_in_year\".")
 
     def _append_obs_aux(self, state, value, list_scales, signed=False):
-        """Normalisation multi-échelle (6 paliers) pour un compartiment type E/M/F qui sont des quantités petites par rapport à Ms."""
+        """Auxiliary function for normalisation functions."""
         if signed: # e.g pour l'erreur e = y_hat - y, qui peut être négative
             for scale in list_scales:
                 state.append(normalize(np.clip(value, -scale, scale), -scale, scale))
@@ -373,26 +526,25 @@ class SimODE_v2:
                 state.append(normalize(np.clip(value, 0, scale), 0, scale))
 
     def _append_EMF_scaled(self, state, value, signed=False):
-        """Normalisation multi-échelle (6 paliers) pour un compartiment type E, M, F."""
+        """Multi scale normalisation for RL for  E, M, F values."""
         list_scales = [10 * self.K, 5 * self.K, self.K, self.K // 10, self.K // 100, self.K // 1000]
         self._append_obs_aux(state, value, list_scales=list_scales, signed=signed)
 
     def _append_Ms_scaled(self, state, value, signed=False):
-            """Normalisation multi-échelle (8 paliers) pour un compartiment type Ms."""
+            """Multi scale normalisation for RL for  Ms values."""
             list_scales = [100 * self.K, 50 * self.K, 10 * self.K, 5* self.K, self.K, self.K // 10, self.K // 100, self.K // 1000]
             self._append_obs_aux(state, value, list_scales=list_scales, signed=signed)   
 
     def _append_u_scaled(self, state, value, signed=False):
-        """Normalisation multi-échelle (6 paliers) pour le contrôle u. 
-        Les valeurs sont plus grandes que E/M/F, donc on prend des paliers plus grands."""
+        """Multi scale normalisation for RL for u values."""
         list_scales = [50 * self.K, 10 * self.K, 5 * self.K, self.K, self.K // 10, self.K // 100]
         self._append_obs_aux(state, value, list_scales=list_scales, signed=signed)
 
     def _append_y_hat_vector(self, state, y_hat):
-        """Ajoute l'observateur comme observation dans le RL. Append un snapshot de y_hat,
-          robuste à sa taille (1, 3 ou 4)."""
+        """Add the observer as observation in the RL. Take a snapshot of y_hat,
+          adapted to its size (1, 3 ou 4)."""
         n = len(y_hat)
-        self._append_EMF_scaled(state, y_hat[0])       # E_hat, toujours présent
+        self._append_EMF_scaled(state, y_hat[0])       # E_hat
         if n >= 3:
             self._append_EMF_scaled(state, y_hat[1])   # M_hat
             self._append_EMF_scaled(state, y_hat[2])   # F_hat
@@ -400,9 +552,9 @@ class SimODE_v2:
                 self._append_Ms_scaled(state, y_hat[3])  # Ms_hat
 
     def _append_e_scaled(self, state, value):
-        """Ajoute l'erreur d'observation e = h(y_hat) - h(y) comme observation dans le RL.
-        Elle peut être négative. 
-        value : y - y_hat, de dimension 1 si obs_E_state est True, sinon 4 (observation totale).
+        """Add the observation error e = h(y_hat) - h(y) as observation in the RL.
+        Can be negative. 
+        value : y - y_hat, size 1 if obs_E_state est True, 4 otherwise (full observation).
         """
         n = len(value) # length of the error vector. 1 or 4
         if self.obs_E_state: # Only E is observed, so the error = E_hat - E
@@ -477,7 +629,7 @@ class SimODE_v2:
         # penalize norm of first three observer errors
 
         if self.rwd_y1 > 0:
-            if not(self.action_only_E):
+            if self.observer_mode == "direct" and not(self.action_only_E):
                 raise ValueError("rwd_y1 needs only one action in E, i.e action_only_E=True")
             diff_state_obs = self.y[0] - self.y_hat[0]
             r = -self.rwd_y1 * np.linalg.norm(diff_state_obs) / self.K
@@ -485,7 +637,7 @@ class SimODE_v2:
             reward += r
 
         if self.rwd_y123 > 0:
-            if self.n_action < 3:
+            if self.observer_mode == "direct" and self.n_action < 3:
                 raise ValueError("rwd_y123 requires at least 3 observed components (action_only_EMF or full mode)")
             diff_state_obs = self.y[:3] - self.y_hat[:3]
             r = -self.rwd_y123 * np.linalg.norm(diff_state_obs) / self.K
@@ -493,7 +645,7 @@ class SimODE_v2:
             reward += r
 
         if self.rwd_y4 > 0:
-            if self.n_action < 3:
+            if self.observer_mode == "direct" and self.n_action < 3:
                 raise ValueError("rwd_y4 requires the full 4-component observer")
             r = -self.rwd_y4 * np.linalg.norm(self.y[3]-self.y_hat[3]) / self.K
             reward_info["rwd_y4"] = r
@@ -512,24 +664,23 @@ class SimODE_v2:
     def simulate(self, n_steps):
         """Simulates the dynamics of the system. Used in tests to see the chosen control acting."""
         for _ in range(n_steps):
-            # action = np.zeros(self.n_action) : fake action to only focus on real state
             self.step(action=np.zeros(self.n_action), store=True)  
     
     def plot(self, title="Mosquito model dynamics", title_ctrl = "", eq_point = None, bool_show=True):
-        '''Plot le résultat de la simulation du système sans contrôle.'''
+        '''Plot trajectories without control.'''
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
         array_t = np.array(self.t_lst)
         array_Y = np.array(self.y_lst)   # shape (T, 5)
 
-        # Couleurs définies une fois
+        # Colours
         cE = 'tab:blue'
         cM = 'tab:orange'
         cF = 'tab:green'
         cMs = 'tab:red'
         cu = 'tab:brown'
 
-        # --- Premier subplot : E, M, F ---
+        # --- First subplot : E, M, F ---
         axes[0].plot(array_t, array_Y[:, 0]/self.K, label='E(t)/K', color=cE)
         axes[0].plot(array_t, array_Y[:, 1]/self.K, label='M(t)/K', color=cM)
         axes[0].plot(array_t, array_Y[:, 2]/self.K, label='F(t)/K', color=cF)
@@ -538,14 +689,14 @@ class SimODE_v2:
         axes[0].set_ylabel('Population')
         axes[0].legend()
 
-        # --- Deuxième subplot : Ms ---
+        # --- Second subplot : Ms ---
         axes[1].plot(array_t, array_Y[:, 3]/self.K, label='Ms(t)', color=cMs)
         axes[1].set_title('Ms/K')
         axes[1].set_xlabel('Temps (jours)')
         axes[1].set_ylabel('Population')
         axes[1].legend()
 
-        # --- Troisième subplot : u ---
+        # --- Third subplot : u ---
         axes[2].plot(array_t, array_Y[:, 4], label='u(t)', color=cu)
         axes[2].set_title("u" + title_ctrl)
         axes[2].set_xlabel('Temps (jours)')

@@ -1,35 +1,41 @@
 """training.py"""
 
 """
-Typical training command for the observer model (dated 23/07/2026), example with a
-one output action (E_hat) and 4 outputs action (E_hat, M_hat, F_hat, Ms_hat):
+Typical training command for the observer model 
 
-  python training.py SimODE_v2 `
-  --sim_kwargs "dict(rwd_y1=1.0, action_only_E=True, obs_E_state=True, obs_multi_scaling=True,factor_K=1)" `
-  --u_types "{'resurgence_lin_deterministic': 1.0}" `
-  --tmax 100.0 --dt 1e-2 `
+For LPSM CPUS : 
+nohup env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 -u training.py SimODE_v2 \
+  --sim_kwargs "dict(
+   rwd_y123 = 0.1, rwd_y4 = 0.001, action_only_E=False, factor_K=1,
+   y_period_history=1.0 , length_y_history=1,
+   obs_E_state=True, obs_u = True, obs_y_hat=False, obs_error_obs=True)" \
+  --u_types "{'u=kE': 0.25, 'u=kF': 0.25, 'res_lin': 0.50}"  \
+  --tmax 300.0 --dt 1e-2  \
+  --gamma 0.99 \
+  --action_min "np.array([0, 0, 0, 0])"  \
+  --action_max "np.array([2*self.sim.K,2*self.sim.K,5*self.sim.K, 100 * self.sim.K])"  \
+  --n_steps_per_action 100 \
+  --batch_size 2048 --n_steps 2048  \
+  --hidden_layer_size 256 --network_depth 2  \
+  --cpus 16 --steps 30000000 --nb_eval_episodes 100 \
+> logs/runs/run0_batchG28.log 2>&1 &
+
+in local : 
+
+python training.py SimODE_v2 `
+  --sim_kwargs "dict(
+   rwd_y123 = 0.1, rwd_y4 = 0.001, action_only_E=False, factor_K=1,
+   y_period_history=1.0 , length_y_history=1,
+   obs_E_state=True, obs_u = True, obs_y_hat=False, obs_error_obs=True)" `
+  --u_types "{'u=kE': 0.25, 'u=kF': 0.25, 'res_lin': 0.50}"  `
+  --tmax 300.0 --dt 1e-2  `
   --gamma 0.99 `
-  --action_min "np.array([0])" `
-  --action_max "np.array([2*self.sim.K])" `
-  --n_steps_per_action 10 `
-  --batch_size 2048 --n_steps 2048 `
-  --hidden_layer_size 256 --network_depth 2 `
-  --cpus 10 --steps 30000 --checkpoint_interval 1500 --nb_eval_episodes 50 `
-  --eval_callback False
-
-
-python training.py SimODE_old `
-  --sim_kwargs "dict(rwd_y123=0.1, rwd_y4=0.001, obs_y=True, obs_u=False, obs_E_state=False, obs_Ms=False, factor_K=1, dynamics_mode=True, dynamics_z=True, lambda_z=0.1, mu_z=0.1, min_value_obs=0)" `
-  --u_types "{'u=kE': 0.25, 'u=kF': 0.25, 'resurgence_lin': 0.50}" `
-  --tmax 1000.0 --dt 1e-2 `
-  --action_min "np.array([-2*self.sim.K,-2*self.sim.K,-5*self.sim.K, -100 * self.sim.K])" `
-  --action_max "np.array([2*self.sim.K,2*self.sim.K,5*self.sim.K, 100 * self.sim.K])" `
-  --gamma 0.995 `
+  --action_min "np.array([0, 0, 0, 0])"  `
+  --action_max "np.array([2*self.sim.K,2*self.sim.K,5*self.sim.K, 100 * self.sim.K])"  `
   --n_steps_per_action 100 `
-  --y_period 1  --length_obs_history 1`
-  --batch_size 2048 --n_steps 2048 `
-  --hidden_layer_size 256 --network_depth 2 `
-  --cpus 16 --steps 40000 --checkpoint_interval 1000 --nb_eval_episodes 50 `
+  --batch_size 2048 --n_steps 2048  `
+  --hidden_layer_size 256 --network_depth 2  `
+  --cpus 16 --steps 30000000 --nb_eval_episodes 100 
   """
 
 import argparse
@@ -183,8 +189,8 @@ if __name__ == '__main__':
     )
 
     # Vectorised Evaluation environment used to save the best model.   
-    eval_interval = int(args.steps * args.eval_interval * 1e-2)  # évalue tous les 2% des pas totaux
-    N_EVAL_ENVS = args.n_eval_envs  # nombre de CPUs utilisés pour l'évaluation
+    eval_interval = int(args.steps * args.eval_interval * 1e-2)  # evaluate every 2% of total steps
+    N_EVAL_ENVS = args.n_eval_envs  # number of CPUs used for evaluation
     bool_eval_callback = args.eval_callback # evaluation callback or not
     if bool_eval_callback:
         eval_env = make_vec_env(
@@ -199,7 +205,7 @@ if __name__ == '__main__':
             best_model_save_path=str(exp_dir / "best_model"),
             log_path=str(exp_dir / "eval_logs"),
             eval_freq=max(eval_interval // args.cpus, 1),
-            n_eval_episodes=args.nb_eval_episodes,   # sera réparti automatiquement en ~args.nb_eval_episodes/N_EVAL_ENVS par sous-env
+            n_eval_episodes=args.nb_eval_episodes,   
             deterministic=True,
             render=False,
         )

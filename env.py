@@ -21,7 +21,21 @@ class RL_env(gym.Env, ABC):
         self.sim = sim_class(**sim_kwargs)
         self.sim.reset()
 
-        # observation space (l'historique, s'il y en a, est géré par self.sim.get_obs())
+        # Observer (attribute in SimODE_v2 ; not present in other classes
+        # such as SimODE_old, with "direct" observer)
+        observer_mode = getattr(self.sim, "observer_mode", "direct")
+        self.is_luenberger_mode = observer_mode in ("luenberger_full", "luenberger_partial")
+
+        # on_time_reward is meaningfull when observation_mode = "direct" : we can compare 
+        # y_hat(t)= action to y(t) before carrying on in the simulation. In Luenberger mode, 
+        # the effet an xhat of L has effect after the integration step so on-time-reward is useless in this case
+        if self.on_time_reward and self.is_luenberger_mode:
+            raise ValueError(
+                f"on_time_reward=True est incompatible avec observer_mode={observer_mode!r} : "
+                "l'action code un gain L, pas une estimation instantanée de l'état."
+            )
+
+        # observation space (the historic is managed by self.sim.get_obs())
         self.n_observations = self.sim.get_obs().shape[0]
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.n_observations,), dtype=np.float32,)
@@ -34,8 +48,7 @@ class RL_env(gym.Env, ABC):
         if isinstance(self.sim, SimODE_old):
             if self.sim.dynamics_mode:
                 if self.sim.dynamics_L:
-                    # Bornes sur les coefficients de L(t). Valeur arbitraires conseillées par Claude pour tester,
-                    #  non vérifiées théoriquement.
+                    # Bound if L(t) coefs. Arbitraty values advised by Claude to test. 
                     val_action = 1.0
                     self.action_min = np.full(16, -val_action)
                     self.action_max = np.full(16,  val_action)
@@ -53,7 +66,7 @@ class RL_env(gym.Env, ABC):
         self.reset()
 
     def compute_reward(self, action=None):
-        return self.sim.reward() # Action n'est pas utilisée dans la reward contrairement au cas du contrôle
+        return self.sim.reward() # action is not used in the reward, unlike the control case
 
     def get_state(self):
         '''Renvoit l'observation du système (historique éventuel géré par self.sim).'''
@@ -70,7 +83,7 @@ class RL_env(gym.Env, ABC):
         # Normalize the action from [-1, 1] -> [action_min, action_max]
         action = self.normalize_action(action)
 
-        if self.on_time_reward: # appropriate to action = y_hat
+        if self.on_time_reward: # appropriate to action = y_hat (mode "direct" uniquement
             self.sim.update_y_hat(action) # y_hat = action based on obs(t). Needed to compare y_hat(t) and y(t) in the reward
 
             #  r_t := f(y(t), y_hat(t)), y_hat mise à jour par le RL à t
@@ -82,15 +95,14 @@ class RL_env(gym.Env, ABC):
 
             state = self.get_state() # update obs: obs based on y(t+dt_a)
 
-        else: # appropriate to aproximations of the dynamics of y_hat, e.g action = L with L Luenberger gain
-            # Steps of the simulation : y goes towards y(t+dt_a), dt_a = nb_step_per_action * dt
+        else:
             for _ in range(self.n_steps_per_action):
                 self.sim.step(action) # update the observer and system
 
             # update state
             state = self.get_state()
 
-            #  r_t+dt_a := f(y(t+dt_a), y_hat(t+dt_a)), y_hat mise à jour par le RL à t et non t+dt_a
+            #  r_t+dt_a := f(y(t+dt_a), y_hat(t+dt_a)), y_hat updated by RL at t and not t+dt_a
             reward, reward_info = self.compute_reward()
 
         info = {
@@ -110,23 +122,29 @@ class RL_env(gym.Env, ABC):
             reward -= 100
             info["explosion"] = True
 
+        # Security clip, complementary of the one of xhat in SimODE_v2) :
+        # error raised by SB3/PyTorch if observation or reward have a NaN/Inf.
+        if not np.all(np.isfinite(state)) or not np.isfinite(reward):
+            terminated = True
+            reward = -100.0
+            info["nan_or_inf_explosion"] = True
+            state = np.nan_to_num(state, nan=0.0, posinf=0.0, neginf=0.0)
+
         return state, reward, terminated, truncated, info # obs_k+1, r_k
 
     def run_episode(self, model, deterministic=True, max_steps=None, store=True, tmax=None):
         """
-        Pareil que step, mais utilisé pour l'évaluation et le callback afin de garder
-        en mémoire l'historique de tout l'épisode pour l'afficher.
-        Similaire à self.step(): le récompense à t=T temps final n'est pas calculée.
+        Plotting function similar to step method. Used for evaluation and callback. Store the history
+        of y_hat and y to plot it.
         Args:
-            model: objet avec .predict(obs, deterministic=...)
-                (self.model dans le callback, ou un modèle worker en éval parallèle)
-            deterministic: passé à model.predict
-            max_steps: nb max de pas d'action (None = jusqu'à done)
-            store: si True, stocke les sous-pas dans sim.t_lst/y_lst/y_hat_lst
+            model:self.model in callback
+            deterministic: input of model.predict
+            max_steps: max number of action step (None -> until done)
+            store: store the dynamics in sim.t_lst/y_lst/y_hat_lst
 
         Returns:
-            dict: t, Y, Y_hat (trajectoires complètes), rewards, t_rewards
-            (temps AVANT chaque pas d'action), reward_infos, terminated, truncated
+            dict: t, Y, Y_hat (trajectories), rewards, t_rewards
+            (Titime before every each action step), reward_infos, terminated, truncated
         """
         obs, _ = self.reset()
         tmax = tmax if tmax is not None else self.tmax
@@ -144,7 +162,8 @@ class RL_env(gym.Env, ABC):
             
 
             if self.on_time_reward:
-                # --- aligné sur RL_env.step() : comparer y_hat(t) à y(t), AVANT d'avancer ---
+                # Same as RL_env.step() : compare y_hat(t) to y(t), before time step 
+                # (only "direct" observer mode, cf. assert in ODE_model_v2.py init)
                 self.sim.update_y_hat(action)
                 reward, reward_info = self.compute_reward()
 
@@ -153,13 +172,11 @@ class RL_env(gym.Env, ABC):
                 for k, v in reward_info.items():
                     reward_infos[k].append(v)
 
-                # --- avance la sim   ---
                 for _ in range(self.n_steps_per_action):
                     self.sim.step(action, store=store)
 
                 state = self.get_state()
             else:
-                # --- avance la sim   ---
                 for _ in range(self.n_steps_per_action):
                     self.sim.step(action, store=store)
 
@@ -172,7 +189,7 @@ class RL_env(gym.Env, ABC):
                     reward_infos[k].append(v)
 
             terminated = self.sim.norm_y() > 1000 * self.sim.K   # explosion
-            truncated = self.sim.t >= tmax                  # limite de temps
+            truncated = self.sim.t >= tmax                  # time limit
 
             if terminated:
                 rewards[-1] -= 100

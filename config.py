@@ -1,6 +1,6 @@
 import numpy as np
 
-# Variables globales utilisées dans le papier de Agbo Bidi, Lichté, Hayat, Coron
+# Parameters used in Agbo Bidi, Lichté, Hayat, Coron
 beta_E = 8.0
 gamma_s = 1.0
 nu_E = 0.25
@@ -108,12 +108,45 @@ def choose_u(u_types, instance_ODE_model=None):
             ctrl_fct = lambda t, EMFMs: resurgence_lin_ctrl(
                 t, EMFMs, threshold_inf, threshold_sup, instance_ODE_model, k, idx_state)
 
+        case "cycle_stab_nonstab_reslin":
+            # Contrôle cycle to have good plots. Enforce to switch contrôle at each episodes  
+            #  deterministically. Used to have the same number of controls is plots: 
+            #   phase 0 : linear control with stabilisation to 0 (k = 3/2 * k_min, kE ou kF)
+            #   phase 1 : linear control with stabilisation to a state which is not 0 (k = 1/2 * k_min, kE ou kF)
+            #   phase 2 : res_lin (resurgence)
+            if instance_ODE_model is None:
+                raise ValueError("Le cas 'cycle_stab_nonstab_reslin' nécessite instance_ODE_model.")
+            forced_phase = getattr(instance_ODE_model, "forced_cycle_phase", None)
+            if forced_phase is not None:
+                phase = forced_phase % 3
+            else:
+                if not hasattr(instance_ODE_model, "_cycle_idx"):
+                    instance_ODE_model._cycle_idx = 0
+                phase = instance_ODE_model._cycle_idx % 3
+                instance_ODE_model._cycle_idx += 1
+
+            if phase == 0:  # linear stabilizing at zero
+                if np.random.randint(0, 2):
+                    k, idx_state = 1.5 * k_F_min, 2  # u = kF
+                else:
+                    k, idx_state = 1.5 * k_E_min, 0  # u = kE
+                ctrl_fct = lambda t, EMFMs: k * EMFMs[idx_state]
+            elif phase == 1:  # linear stabilizing at a non zero equilibrium
+                if np.random.randint(0, 2):
+                    k, idx_state = 0.5 * k_F_min, 2
+                else:
+                    k, idx_state = 0.5 * k_E_min, 0
+                ctrl_fct = lambda t, EMFMs: k * EMFMs[idx_state]
+            else:  # phase == 2 : res_lin
+                if np.random.randint(0, 2):
+                    k, idx_state = np.random.uniform(k_F_min, 2 * k_F_min), 2
+                else:
+                    k, idx_state = np.random.uniform(k_E_min, 2 * k_E_min), 0
+                threshold_inf = np.random.uniform(0.1 * K, 0.3 * K)
+                threshold_sup = np.random.uniform(0.7 * K, K)
+                ctrl_fct = lambda t, EMFMs: resurgence_lin_ctrl(
+                    t, EMFMs, threshold_inf, threshold_sup, instance_ODE_model, k, idx_state)
+
         case _:
             raise ValueError("Unvalid control type")
     return ctrl_fct, ctrl_type
-
-# Tests
-if False:
-    print("Test k : ", )
-    for _ in range(5):
-        print(f"-  kE = {choose_k_E()}, kF = {choose_k_F()}")

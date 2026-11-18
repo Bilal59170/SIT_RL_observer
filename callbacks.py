@@ -30,7 +30,7 @@ class ProgressCallback(BaseCallback):
     def _on_step(self):
         now = time.time()
 
-        # affichage toutes les X secondes
+        # Display every X seconds
         if now - self.last_print_time < self.every_seconds:
             return True
 
@@ -39,10 +39,10 @@ class ProgressCallback(BaseCallback):
         elapsed = now - self.start_time
         steps = self.num_timesteps
 
-        # progression (%)
+        # Progression (%)
         pct = 100.0 * steps / self.total_timesteps if self.total_timesteps > 0 else 0.0
 
-        # vitesse + Temps restant
+        # Speed + remaining time
         if steps > 0 and elapsed > 0:
             speed = steps / elapsed  # steps/sec
             remaining_steps = self.total_timesteps - steps
@@ -83,10 +83,10 @@ class TensorboardCallback(BaseCallback):
 
     def _on_rollout_end(self):
         try:
-            # reset de l'environnement d'évaluation
+            # reset de evaluation environment
             _, _ = self.eval_env.reset()
 
-            # forcer le stockage du point initial
+            # enforce storage of initial point
             self.eval_env.sim.t_lst = [self.eval_env.sim.t]
             self.eval_env.sim.y_lst = [np.copy(self.eval_env.sim.y)]
             self.eval_env.sim.y_hat_lst = [np.copy(self.eval_env.sim.y_hat)]
@@ -106,7 +106,7 @@ class TensorboardCallback(BaseCallback):
             y_hat_lst = np.array(self.eval_env.sim.y_hat_lst)  
             K = self.eval_env.sim.K
 
-            # discounted reward gamma^t * r_t (t indexé sur les actions, pas le temps physique)
+            # discounted reward gamma^t * r_t (t indexed on actions, not physical time)
             discounted_rewards = np.array(
                 [gamma**i * r for i, r in enumerate(rewards)]
             )
@@ -118,7 +118,7 @@ class TensorboardCallback(BaseCallback):
             # ── LOG PLOTS ────────────────────────────────────────────────
             def plot(name, x, y_dict, xlabel, ylabel, title,
                     grid=True, legend=True, figsize=(5, 3), max_points=1000):
-                # sous-échantillonnage pour avoir un plot moins cher
+                # under-sampling to have a cheaper graph to plot
                 n = len(x)
                 if n > max_points:
                     idx = np.linspace(0, n - 1, max_points, dtype=int)
@@ -143,12 +143,12 @@ class TensorboardCallback(BaseCallback):
                 )
                 plt.close()
             
-            # 1. E, M, F (états réels)
+            # 1. E, M, F 
             plot('EMF_by_t', t_lst,
                 {'E/K': y_lst[:, 0]/K, 'M/K': y_lst[:, 1]/K, 'F/K': y_lst[:, 2]/K},
                 xlabel='t', ylabel='Population', title='E/K, M/K, F/K')
                 
-            # Ms (état réel)
+            # Ms
             plot('Ms_by_t', t_lst,
                 {'Ms/K': y_lst[:, 3]/K},
                 xlabel='t', ylabel='Population', title='Ms/K')
@@ -175,7 +175,7 @@ class TensorboardCallback(BaseCallback):
                     {'E/K': y_lst[:, 0]/K, 'M/K': y_lst[:, 1]/K, 'F/K': y_lst[:, 2]/K},
                     xlabel='t', ylabel='Population', title='E/K, M/K, F/K')
 
-            # ── PLOTS OBSERVATEURS ET ERREURS ────────────────────────
+            # ── PLOTS OBSERVERS AND ERRORS ────────────────────────
             if n_obs == 1:
                 plot('E_hat_by_t', t_lst,
                     {'E_hat/K': y_hat_lst[:, 0]/K},
@@ -213,11 +213,11 @@ class TensorboardCallback(BaseCallback):
                     {'(Ms-Ms_hat)/K': (y_lst[:, 3] - y_hat_lst[:, 3])/K},
                     xlabel='t', ylabel='Erreur', title='Erreur d\'observation (Ms-Ms_hat)')
 
-            # ── PLOT CONTRÔLE ─────────────────────────────────────────
+            # ── PLOT CONTROL ─────────────────────────────────────────
             plot('u_by_t', t_lst, {'u': y_lst[:, 4]},
                 xlabel='t', ylabel='u(t)', title='Contrôle u(t)', legend=False)
 
-            # ── PLOT BREAKDOWN RÉCOMPENSES ────────────────────────────
+            # ── PLOT REWARD BREAKDOWN ────────────────────────────
             if reward_infos:
                 # Trim in case 
                 # n_min = min(len(v) for v in reward_infos.values())
@@ -231,11 +231,11 @@ class TensorboardCallback(BaseCallback):
                     xlabel='t', ylabel='r_i(t)',
                     title='Breakdown of reward components by time')
                 
-            # Reward globale r_t
+            # Total reward  r_t
             plot('r_by_t', env_times, {'r': rewards},
                 xlabel='t', ylabel='r(t)', title='Reward by time', legend=False)
 
-            # Reward actualisée gamma^t * r_t
+            # Discounted reward gamma^t * r_t
             plot('discounted_r_by_t', env_times, {'gamma^t * r_t': discounted_rewards},
                 xlabel='t', ylabel='gamma^t * r(t)',
                 title='Discounted reward by time', legend=False)
