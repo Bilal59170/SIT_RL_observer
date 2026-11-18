@@ -1,7 +1,11 @@
-.DS_STORE
-logs/
 __pycache__/
-*.pyc
-*.gif
-*.mp4
-wandb/
+.vscode/
+# RL models that are heavy 
+logs/    
+# Some training commands
+training_commands/
+# Experimental plots 
+plot_eval_train/   
+plot_eval_train_saved/
+# File for testing or generating command lines (not useful)
+utilitaires.py
