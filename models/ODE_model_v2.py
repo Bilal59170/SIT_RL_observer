@@ -44,7 +44,7 @@ class SimODE_v2:
         obs_Ms=False, 
         obs_time=False,
         obs_time_mode="absolute",
-        obs_multi_scaling = True, # Observation scaling
+        obs_error_obs=False,
 
         # Action
         action_only_E=False, # Output
@@ -85,7 +85,7 @@ class SimODE_v2:
         self.obs_Ms=obs_Ms
         self.obs_time=obs_time
         self.obs_time_mode=obs_time_mode
-        self.obs_multi_scaling = obs_multi_scaling
+        self.obs_error_obs = obs_error_obs
         
         # State
         self.n_state = 4
@@ -103,7 +103,7 @@ class SimODE_v2:
 
         # Historics
         if y_period_history is not None and not (self.obs_E_state) : 
-            ValueError("Historic not implemented for observations other than E and u.")
+            raise ValueError("Historic not implemented for observations other than E.")
         self.y_period_history = y_period_history # same period for any state historic
         self.length_y_history = length_y_history
         self.next_y_time = np.inf
@@ -119,6 +119,11 @@ class SimODE_v2:
         self.length_y_hat_history = length_y_history  # same length as y_history
         self.next_y_hat_time = np.inf
         self._y_hat_history = None # initilised in reset()
+        # error error_obs_obs = y_hat - y (erreur de l'observateur avec observation totale)
+        self.length_error_obs_history = length_y_history
+        self._error_obs_history = None  # initialisé dans reset()
+        self.next_error_obs_time = np.inf
+
 
         # Control parameters
         self.u_types = u_types
@@ -190,6 +195,17 @@ class SimODE_v2:
         )
         self.next_y_hat_time = self.next_y_time
 
+        # error_obs = y_hat - y
+        if self.obs_E_state:
+            error_obs_0 = np.array([self.y_hat[0] - self.y[0]]) # error on E only
+        else:
+            error_obs_0 = self.y_hat - self.y[:self.n_action] # error on all observed components
+        self._error_obs_history = deque(
+            [np.copy(error_obs_0) for _ in range(self.length_error_obs_history)],
+            maxlen=self.length_error_obs_history
+        )
+        self.next_error_obs_time = self.next_y_time
+
     def dynamics(self, y):
         """
         y : [E, M, F, M_s, u]   (5 components, u = y[4])
@@ -260,6 +276,22 @@ class SimODE_v2:
         if next_time is not None:
             self.next_u_time = next_time
 
+    def update_observation_error_obs(self):
+        """Met à jour l'historique de l'erreur e = y_hat - y[:n_action]."""
+        if self.obs_E_state:
+            error_obs = np.array([self.y_hat[0] - self.y[0]]) # error on E only
+        else:
+            error_obs = self.y_hat - self.y[:self.n_action] # error on all observed components
+        next_time = self.update_observations_aux(
+            period=self.y_period_history,
+            state=error_obs,
+            history=self._error_obs_history,
+            t=self.t,
+            next_time=self.next_error_obs_time
+        )
+        if next_time is not None:
+            self.next_error_obs_time = next_time
+
     def update_y(self):
         '''One Euler step of the system.'''
 
@@ -272,13 +304,15 @@ class SimODE_v2:
         # Rebuild full state (E, M, F, Ms, u)(t+dt)
         self.y   = np.append(new_emfs, new_u)
 
-        # Update historic 
+        # Update historic of quantities that only depend on y
         self.update_observation_E() # E(t) 
         self.update_observation_u() # u(t)
 
     def update_y_hat(self, action): 
         """Update the observer. Used in env.py, not in step."""
         self.y_hat = action # Direct approximation of the state : y_hat = action 
+
+        # Update historic of quantities that only depend on y_hat
         self.update_observation_y_hat()
 
     def step(self, action, store=False):
@@ -291,14 +325,17 @@ class SimODE_v2:
 
         # increment time
         self.t += self.dt
-        self.update_y()
-        self.update_y_hat(action)  # y_hat updated at each step
+        self.update_y() # y(t+dt)
+        self.update_y_hat(action)  # y_hat updated
 
+        # Update the error error_obs_obs = y_hat - y[:n_action] for the observation
+        self.update_observation_error_obs() 
         # save for later plotting/metrics only when requested
         if store:
             self.t_lst.append(self.t)
             self.y_lst.append(np.copy(self.y))
             self.y_hat_lst.append(np.copy(self.y_hat))
+            
     
     ##################
     # Observations 
@@ -325,69 +362,61 @@ class SimODE_v2:
             return normalize(self.t, 0.0, tmax)
         else:
             raise ValueError("obs_time_mode value is wrong. Should be \"absolute\", \"season\", or \"week_in_year\".")
- 
-    def _append_E_scaled(self, state, value):
-        """Normalisation multi-échelle (6 paliers) pour un compartiment type E/M/F."""
-        if self.obs_multi_scaling:
-            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
-            state.append(normalize(min(value, self.K),      0, self.K))
-            state.append(normalize(min(value, 5000),        0, 5000))
-            state.append(normalize(min(value, 500),         0, 500))
-            state.append(normalize(min(value, 50),          0, 50))
-            state.append(normalize(min(value, 5),           0, 5))
-        else:
-            state.append(normalize(value, 0, 2 * self.K))
-    
-    def _append_M_scaled(self, state, value):
-        self._append_E_scaled(state, value)
 
-    def _append_F_scaled(self, state, value):
-        """Pareil que pour E mais scaling sans multi scaling est de 5*K et non de 2*K car F souvent plus grand que 2K. """
-        if self.obs_multi_scaling:
-            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
-            state.append(normalize(min(value, self.K),      0, self.K))
-            state.append(normalize(min(value, 5000),        0, 5000))
-            state.append(normalize(min(value, 500),         0, 500))
-            state.append(normalize(min(value, 50),          0, 50))
-            state.append(normalize(min(value, 5),           0, 5))
-        else:
-            state.append(normalize(value, 0, 5 * self.K))
+    def _append_obs_aux(self, state, value, list_scales, signed=False):
+        """Normalisation multi-échelle (6 paliers) pour un compartiment type E/M/F qui sont des quantités petites par rapport à Ms."""
+        if signed: # e.g pour l'erreur e = y_hat - y, qui peut être négative
+            for scale in list_scales:
+                state.append(normalize(np.clip(value, -scale, scale), -scale, scale))
+        else: # Pour des compartiments E, M, F qui sont positifs
+            for scale in list_scales:
+                state.append(normalize(np.clip(value, 0, scale), 0, scale))
 
-    def _append_Ms_scaled(self, state, value):
-        """Normalisation multi-échelle (8 paliers) pour un compartiment type Ms."""
-        if self.obs_multi_scaling:
-            state.append(normalize(value, 0, 100 * self.K))
-            state.append(normalize(min(value, 50 * self.K), 0, 50 * self.K))
-            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
-            state.append(normalize(min(value, self.K),      0, self.K))
-            state.append(normalize(min(value, 5000),        0, 5000))
-            state.append(normalize(min(value, 500),         0, 500))
-            state.append(normalize(min(value, 50),          0, 50))
-            state.append(normalize(min(value, 5),           0, 5))
-        else:
-            state.append(normalize(value, 0, 50 * self.K))
+    def _append_EMF_scaled(self, state, value, signed=False):
+        """Normalisation multi-échelle (6 paliers) pour un compartiment type E, M, F."""
+        list_scales = [10 * self.K, 5 * self.K, self.K, self.K // 10, self.K // 100, self.K // 1000]
+        self._append_obs_aux(state, value, list_scales=list_scales, signed=signed)
 
-    def _apprend_u_scaled(self, state, value):
-        """Normalisation multi-échelle (6 paliers) pour le contrôle u."""
-        if self.obs_multi_scaling:
-            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
-            state.append(normalize(min(value, self.K),      0, self.K))
-            state.append(normalize(min(value, 5000),        0, 5000))
-            state.append(normalize(min(value, 500),         0, 500))
-            state.append(normalize(min(value, 50),          0, 50))
-            state.append(normalize(min(value, 5),           0, 5))
-        else:
-            state.append(normalize(min(value, 10 * self.K), 0, 10 * self.K))
+    def _append_Ms_scaled(self, state, value, signed=False):
+            """Normalisation multi-échelle (8 paliers) pour un compartiment type Ms."""
+            list_scales = [100 * self.K, 50 * self.K, 10 * self.K, 5* self.K, self.K, self.K // 10, self.K // 100, self.K // 1000]
+            self._append_obs_aux(state, value, list_scales=list_scales, signed=signed)   
 
-    def _append_y_hat_vector(self, state, y_hat_vec):
-        """Append un snapshot de y_hat, robuste à sa taille (1, 3 ou 4)."""
-        n = len(y_hat_vec)
-        self._append_E_scaled(state, y_hat_vec[0])       # E_hat, toujours présent
+    def _append_u_scaled(self, state, value, signed=False):
+        """Normalisation multi-échelle (6 paliers) pour le contrôle u. 
+        Les valeurs sont plus grandes que E/M/F, donc on prend des paliers plus grands."""
+        list_scales = [50 * self.K, 10 * self.K, 5 * self.K, self.K, self.K // 10, self.K // 100]
+        self._append_obs_aux(state, value, list_scales=list_scales, signed=signed)
+
+    def _append_y_hat_vector(self, state, y_hat):
+        """Ajoute l'observateur comme observation dans le RL. Append un snapshot de y_hat,
+          robuste à sa taille (1, 3 ou 4)."""
+        n = len(y_hat)
+        self._append_EMF_scaled(state, y_hat[0])       # E_hat, toujours présent
         if n >= 3:
-            self._append_M_scaled(state, y_hat_vec[1])   # M_hat
-            self._append_F_scaled(state, y_hat_vec[2])   # F_hat
-        if n >= 4:
-            self._append_Ms_scaled(state, y_hat_vec[3])  # Ms_hat
+            self._append_EMF_scaled(state, y_hat[1])   # M_hat
+            self._append_EMF_scaled(state, y_hat[2])   # F_hat
+            if n >= 4:
+                self._append_Ms_scaled(state, y_hat[3])  # Ms_hat
+
+    def _append_e_scaled(self, state, value):
+        """Ajoute l'erreur d'observation e = h(y_hat) - h(y) comme observation dans le RL.
+        Elle peut être négative. 
+        value : y - y_hat, de dimension 1 si obs_E_state est True, sinon 4 (observation totale).
+        """
+        n = len(value) # length of the error vector. 1 or 4
+        if self.obs_E_state: # Only E is observed, so the error = E_hat - E
+            assert n == 1, "Error vector should have 1 component for E observation."
+            self._append_EMF_scaled(state, value[0], signed=True)       # E_hat - E,
+        else: # Full observation of y_hat, so the error = y_hat - y
+            assert n == 4, "Error vector should have 4 components for full observation."
+            self._append_EMF_scaled(state, value[0], signed=True)       # E_hat - E,
+            self._append_EMF_scaled(state, value[1], signed=True)   # M_hat - M
+            self._append_EMF_scaled(state, value[2], signed=True)   # F_hat - F
+            self._append_Ms_scaled(state, value[3], signed=True)    # Ms_hat - Ms
+
+        
+
 
     def get_obs(self):
         """Get the observations of the systems. 
@@ -402,30 +431,38 @@ class SimODE_v2:
         if self.obs_time:
             state.append(self._get_time_obs())
 
-        # Observer
+        # Observer y_hat
         if self.obs_y_hat:
-            for y_hat_snapshot in self._y_hat_history:
-                self._append_y_hat_vector(state, y_hat_snapshot)
-                
-        # Other
+            for y_hat in self._y_hat_history:
+                self._append_y_hat_vector(state, y_hat)
+
+        # e = y_hat - y
+        if self.obs_error_obs:
+            for e_snap in self._error_obs_history:
+                self._append_e_scaled(state, e_snap)
+
+        # E
         if self.obs_E_state:
             for e_state in self._E_history:
-                self._append_E_scaled(state, value=e_state)
+                self._append_EMF_scaled(state, value=e_state)
 
+        # EMF (not used in experiments with historic)
         if self.obs_EMF:
             e_obs, m_obs, f_obs = y[0], y[1], y[2]
-            self._append_E_scaled(state, value=e_obs)
-            self._append_M_scaled(state, value=m_obs)
-            self._append_F_scaled(state, value=f_obs)
+            self._append_EMF_scaled(state, value=e_obs) # E
+            self._append_EMF_scaled(state, value=m_obs) # M
+            self._append_EMF_scaled(state, value=f_obs) # F
 
+        # Ms (not used in experiments with historic)
         if self.obs_Ms:
             # Same rescaling as M+Ms in the control code
             ms = y[3]
             self._append_Ms_scaled(state, value=ms)
 
+        # u
         if self.obs_u:
             for u_snap in self._u_history:
-                self._apprend_u_scaled(state, value=u_snap)
+                self._append_u_scaled(state, value=u_snap)
 
         return np.array(state)  # no normalisation or multi-scale strategy for now
     
@@ -433,7 +470,7 @@ class SimODE_v2:
     # Reward
     ##############
 
-    def reward(self, action=None):
+    def reward(self):
         reward = 0
         reward_info = {}
 

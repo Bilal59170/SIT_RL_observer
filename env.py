@@ -49,11 +49,11 @@ class RL_env(gym.Env, ABC):
         assert len(self.action_max) == self.n_actions, \
         f"action_max shape {len(self.action_max)} != n_actions {self.n_actions}"
 
-        # reset env
+        # reset env : sees the state of the system at time t=0 
         self.reset()
 
-    def compute_reward(self, action):
-        return self.sim.reward(action)
+    def compute_reward(self, action=None):
+        return self.sim.reward() # Action n'est pas utilisée dans la reward contrairement au cas du contrôle
 
     def get_state(self):
         '''Renvoit l'observation du système (historique éventuel géré par self.sim).'''
@@ -74,7 +74,7 @@ class RL_env(gym.Env, ABC):
             self.sim.update_y_hat(action) # y_hat = action based on obs(t). Needed to compare y_hat(t) and y(t) in the reward
 
             #  r_t := f(y(t), y_hat(t)), y_hat mise à jour par le RL à t
-            reward, reward_info = self.compute_reward(action) 
+            reward, reward_info = self.compute_reward() 
 
             # Steps of the simulation : y goes towards y(t+dt_a), dt_a = nb_step_per_action * dt
             for _ in range(self.n_steps_per_action):
@@ -83,7 +83,7 @@ class RL_env(gym.Env, ABC):
             state = self.get_state() # update obs: obs based on y(t+dt_a)
 
         else: # appropriate to aproximations of the dynamics of y_hat, e.g action = L with L Luenberger gain
-            # step simulation with observer dynamics
+            # Steps of the simulation : y goes towards y(t+dt_a), dt_a = nb_step_per_action * dt
             for _ in range(self.n_steps_per_action):
                 self.sim.step(action) # update the observer and system
 
@@ -91,7 +91,7 @@ class RL_env(gym.Env, ABC):
             state = self.get_state()
 
             #  r_t+dt_a := f(y(t+dt_a), y_hat(t+dt_a)), y_hat mise à jour par le RL à t et non t+dt_a
-            reward, reward_info = self.compute_reward(action)
+            reward, reward_info = self.compute_reward()
 
         info = {
             'scaled_action': action,
@@ -146,7 +146,7 @@ class RL_env(gym.Env, ABC):
             if self.on_time_reward:
                 # --- aligné sur RL_env.step() : comparer y_hat(t) à y(t), AVANT d'avancer ---
                 self.sim.update_y_hat(action)
-                reward, reward_info = self.compute_reward(action)
+                reward, reward_info = self.compute_reward()
 
                 rewards.append(reward)
                 t_rewards.append(self.sim.t)
@@ -165,7 +165,7 @@ class RL_env(gym.Env, ABC):
 
                 state = self.get_state()
 
-                reward, reward_info = self.compute_reward(action)
+                reward, reward_info = self.compute_reward()
                 rewards.append(reward)
                 t_rewards.append(self.sim.t)
                 for k, v in reward_info.items():
