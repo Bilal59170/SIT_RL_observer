@@ -1,0 +1,61 @@
+{
+    "args": {
+        "sim": "SimODE_v2",
+        "sim_kwargs": "dict(\n   rwd_y123 = 0.1, rwd_y4 = 0.001, factor_K=1,\n   y_period_history=1.0 , length_y_history=1,\n   obs_E_state=True, obs_u = True, obs_y_hat=True, obs_error_obs=False,\n   observer_mode='luenberger_partial')",
+        "u_types": "{'u=kE': 0.25, 'u=kF': 0.25, 'res_lin': 0.50}",
+        "dt": 0.01,
+        "tmax": 300.0,
+        "y0": null,
+        "y0_without_u0": null,
+        "action_min": "np.array([-1, -1, -1, -1])",
+        "action_max": "np.array([1, 1, 1, 1])",
+        "n_steps_per_action": 100,
+        "on_time_reward": false,
+        "gamma": 0.99,
+        "cpus": 1,
+        "steps": 30000.0,
+        "lr": 0.0003,
+        "n_steps": 2048,
+        "batch_size": 2048,
+        "n_epochs": 5,
+        "checkpoint_interval": 5000,
+        "network_depth": 2,
+        "hidden_layer_size": 256,
+        "eval_callback": false,
+        "nb_eval_episodes": 100,
+        "eval_interval": 2.0,
+        "n_eval_envs": 4,
+        "verbose": false,
+        "track": false,
+        "wandb_group": null
+    },
+    "env_kwargs": {
+        "sim_class": "<class 'models.ODE_model_v2.SimODE_v2'>",
+        "sim_kwargs": {
+            "u_types": {
+                "u=kE": 0.25,
+                "u=kF": 0.25,
+                "res_lin": 0.5
+            },
+            "dt": 0.01,
+            "tmax": 300.0,
+            "rwd_y123": 0.1,
+            "rwd_y4": 0.001,
+            "factor_K": 1,
+            "y_period_history": 1.0,
+            "length_y_history": 1,
+            "obs_E_state": true,
+            "obs_u": true,
+            "obs_y_hat": true,
+            "obs_error_obs": false,
+            "observer_mode": "luenberger_partial"
+        },
+        "config": {
+            "tmax": 300.0,
+            "action_min": "np.array([-1, -1, -1, -1])",
+            "action_max": "np.array([1, 1, 1, 1])",
+            "n_steps_per_action": 100,
+            "on_time_reward": false
+        }
+    }
+}

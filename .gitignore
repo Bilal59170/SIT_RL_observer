@@ -1,13 +1,2 @@
 __pycache__/
 .vscode/
-# RL models that are heavy 
-logs/    
-# Some training commands
-training_commands/
-# Experimental plots 
-plot_eval_train/   
-plot_eval_train_saved/
-# File for testing or generating command lines (not useful)
-utilitaires.py
-# Writing of the next commit
-next_commit.txt

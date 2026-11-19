@@ -1,0 +1,19 @@
+Référence expérience : 1785937108_pid47588_05Aug26_15h38m28s_plot\T_default\best_model\res_lin-0.5_u=kE-0.25_u=kF-0.25
+Nombre d'essais      : 200
+K = 50000
+
+--- Seuil 1% de K ---
+Temps moyens de convergence (jours) pour (E, M, F, Ms) : (123, 185, 213, 250)
+Taux de succes de convergence (%) pour (E, M, F, Ms) : (35.0, 38.5, 25.0, 9.5)
+
+--- Seuil 5% de K ---
+Temps moyens de convergence (jours) pour (E, M, F, Ms) : (136, 151, 182, 229)
+Taux de succes de convergence (%) pour (E, M, F, Ms) : (68.0, 93.5, 67.0, 12.0)
+
+--- Récompense moyenne ---
+Récompense moyenne sur 200 essais : -0.01
+
+--- Problème d'annulation d'observateur ---
+Taux (en %): (E=26.5, M=27.0, F=23.5, Ms=73.0)
+État moyen (/K) : (E=0.04, M=0.07, F=0.05, Ms=8.15)
+Écart type (/K) : (E=0.01, M=0.05, F=0.00, Ms=6.89)
